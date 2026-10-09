@@ -1,38 +1,6 @@
 name: Workspace Quality
 
 on:
-  push:
-    branches:
-      - main
-      - dev
-      - custom
-    paths:
-      - "backend/**"
-      - "frontend/**"
-      - "packages/**"
-      - "package.json"
-      - "pnpm-lock.yaml"
-      - "pnpm-workspace.yaml"
-      - "turbo.json"
-      - "scripts/sync-version.mjs"
-      - "VERSION"
-      - ".github/workflows/frontend-quality.yml"
-  pull_request:
-    branches:
-      - main
-      - dev
-      - custom
-    paths:
-      - "backend/**"
-      - "frontend/**"
-      - "packages/**"
-      - "package.json"
-      - "pnpm-lock.yaml"
-      - "pnpm-workspace.yaml"
-      - "turbo.json"
-      - "scripts/sync-version.mjs"
-      - "VERSION"
-      - ".github/workflows/frontend-quality.yml"
   workflow_dispatch:
 
 permissions:
