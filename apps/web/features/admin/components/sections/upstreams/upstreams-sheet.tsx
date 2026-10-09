@@ -2,7 +2,9 @@
 
 import {
   Braces,
+  Check,
   ChevronDown,
+  Copy,
   Fingerprint,
   KeyRound,
   ListPlus,
@@ -393,6 +395,17 @@ export function UpstreamSheet({
   const [pendingDeleteAPIKeyIDs, setPendingDeleteAPIKeyIDs] = useState<Set<string>>(() => new Set());
   const [deleteAPIKeyTarget, setDeleteAPIKeyTarget] = useState<MaskedAPIKeyItem | null>(null);
   const stableDeleteAPIKeyTarget = useDialogSnapshot(deleteAPIKeyTarget);
+  const [copiedKeyId, setCopiedKeyId] = useState<string | null>(null);
+
+  async function copyToClipboard(text: string, id: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedKeyId(id);
+      setTimeout(() => setCopiedKeyId((prev) => (prev === id ? null : prev)), 2000);
+    } catch {
+      toast.error(commonT("errors.copyFailed"));
+    }
+  }
 
   useEffect(() => {
     if (open) {
@@ -603,9 +616,34 @@ export function UpstreamSheet({
             </div>
 
             <div className="min-w-0 space-y-1">
-              <Label className="text-xs font-normal text-muted-foreground" htmlFor="upstream-keys">
-                {mode === "create" ? `${t("sheet.apiKeys")} *` : t("sheet.apiKeysAdd")}
-              </Label>
+              <div className="flex items-center justify-between gap-2">
+                <Label className="text-xs font-normal text-muted-foreground" htmlFor="upstream-keys">
+                  {mode === "create" ? `${t("sheet.apiKeys")} *` : t("sheet.apiKeysAdd")}
+                </Label>
+                {form.apiKeysLines.trim() ? (
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-sm"
+                        className="size-6 shrink-0 text-muted-foreground hover:text-foreground"
+                        aria-label={copiedKeyId === "textarea" ? commonT("actions.copied") : commonT("actions.copy")}
+                        onClick={() => copyToClipboard(form.apiKeysLines, "textarea")}
+                      >
+                        {copiedKeyId === "textarea" ? (
+                          <Check className="size-3.5 stroke-1" />
+                        ) : (
+                          <Copy className="size-3.5 stroke-1" />
+                        )}
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent side="top">
+                      {copiedKeyId === "textarea" ? commonT("actions.copied") : commonT("actions.copy")}
+                    </TooltipContent>
+                  </Tooltip>
+                ) : null}
+              </div>
               <Textarea
                 id="upstream-keys"
                 className={`h-24 resize-none overflow-auto whitespace-pre [field-sizing:fixed] ${CODE_TEXTAREA_CLASS}`}
