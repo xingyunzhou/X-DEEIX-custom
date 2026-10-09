@@ -3371,6 +3371,8 @@ export interface PublicModelResponse {
   displayGroupID: number | null;
   displayGroupIcon: string;
   displayGroupName: string;
+  upstreamID: number | null;
+  upstreamName: string;
   icon: string;
   kindsJSON: string;
   platformModelName: string;

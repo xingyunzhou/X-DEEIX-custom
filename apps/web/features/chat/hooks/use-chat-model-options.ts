@@ -387,6 +387,8 @@ function toChatModelOption(
     displayGroupID: item.displayGroupID,
     displayGroupName: item.displayGroupName,
     displayGroupIcon: item.displayGroupIcon,
+    upstreamID: item.upstreamID ?? undefined,
+    upstreamName: item.upstreamName || undefined,
     kinds: parseKindsJSON(item.kindsJSON),
     protocols,
     supportsVision: resolveSupportsVision(capabilitiesJSON),

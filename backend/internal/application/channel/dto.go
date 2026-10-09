@@ -180,11 +180,13 @@ type ModelView struct {
 	CbDurationMin      int
 	CbWindowMin        int
 	SortOrder          int
-	SourceCount        int64
-	ActiveSourceCount  int64
-	ProtocolsJSON      string
-	UpstreamNamesJSON  string
-	Pricing            *appbilling.PublicModelPricing
+	SourceCount         int64
+	ActiveSourceCount   int64
+	ProtocolsJSON       string
+	UpstreamNamesJSON   string
+	PrimaryUpstreamID   *uint
+	PrimaryUpstreamName string
+	Pricing             *appbilling.PublicModelPricing
 	CreatedAt          string
 	UpdatedAt          string
 	DefaultTaskTypes   []string

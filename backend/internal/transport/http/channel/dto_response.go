@@ -637,20 +637,22 @@ type CircuitResetResponse struct {
 
 // PublicModelResponse 面向前端的可用模型展示 DTO。
 type PublicModelResponse struct {
-	PlatformModelName string                      `json:"platformModelName"`
-	Vendor            string                      `json:"vendor"`
-	VendorName        string                      `json:"vendorName"`
-	VendorIcon        string                      `json:"vendorIcon"`
-	DisplayGroupID    *uint                       `json:"displayGroupID" extensions:"x-nullable,!x-omitempty"`
-	DisplayGroupName  string                      `json:"displayGroupName"`
-	DisplayGroupIcon  string                      `json:"displayGroupIcon"`
-	KindsJSON         string                      `json:"kindsJSON"`
-	Icon              string                      `json:"icon"`
-	ProtocolsJSON     string                      `json:"protocolsJSON"`
-	CapabilitiesJSON  string                      `json:"capabilitiesJSON"`
-	Description       string                      `json:"description"`
-	SortOrder         int                         `json:"sortOrder"`
-	Pricing           *PublicModelPricingResponse `json:"pricing" extensions:"x-nullable,!x-omitempty"`
+	PlatformModelName   string                      `json:"platformModelName"`
+	Vendor              string                      `json:"vendor"`
+	VendorName          string                      `json:"vendorName"`
+	VendorIcon          string                      `json:"vendorIcon"`
+	DisplayGroupID      *uint                       `json:"displayGroupID" extensions:"x-nullable,!x-omitempty"`
+	DisplayGroupName    string                      `json:"displayGroupName"`
+	DisplayGroupIcon    string                      `json:"displayGroupIcon"`
+	UpstreamID          *uint                       `json:"upstreamID" extensions:"x-nullable,!x-omitempty"`
+	UpstreamName        string                      `json:"upstreamName"`
+	KindsJSON           string                      `json:"kindsJSON"`
+	Icon                string                      `json:"icon"`
+	ProtocolsJSON       string                      `json:"protocolsJSON"`
+	CapabilitiesJSON    string                      `json:"capabilitiesJSON"`
+	Description         string                      `json:"description"`
+	SortOrder           int                         `json:"sortOrder"`
+	Pricing             *PublicModelPricingResponse `json:"pricing" extensions:"x-nullable,!x-omitempty"`
 }
 
 // PublicModelPricingResponse 面向前端的模型价格 DTO。
@@ -850,6 +852,8 @@ func toPublicModelResponse(v appchannel.ModelView) PublicModelResponse {
 		DisplayGroupID:    v.DisplayGroupID,
 		DisplayGroupName:  v.DisplayGroupName,
 		DisplayGroupIcon:  v.DisplayGroupIcon,
+		UpstreamID:        v.PrimaryUpstreamID,
+		UpstreamName:      v.PrimaryUpstreamName,
 		KindsJSON:         v.KindsJSON,
 		Icon:              v.Icon,
 		ProtocolsJSON:     v.ProtocolsJSON,

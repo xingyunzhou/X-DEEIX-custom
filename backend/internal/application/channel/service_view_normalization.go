@@ -97,9 +97,11 @@ func (s *Service) toModelView(item repository.ChannelModelListRow) ModelView {
 		SortOrder:          item.SortOrder,
 		SourceCount:        item.SourceCount,
 		ActiveSourceCount:  item.ActiveSourceCount,
-		ProtocolsJSON:      item.ProtocolsJSON,
-		UpstreamNamesJSON:  item.UpstreamNamesJSON,
-		CreatedAt:          item.CreatedAt.Format(time.RFC3339),
+		ProtocolsJSON:       item.ProtocolsJSON,
+		UpstreamNamesJSON:   item.UpstreamNamesJSON,
+		PrimaryUpstreamID:   item.PrimaryUpstreamID,
+		PrimaryUpstreamName: item.PrimaryUpstreamName,
+		CreatedAt:           item.CreatedAt.Format(time.RFC3339),
 		UpdatedAt:          item.UpdatedAt.Format(time.RFC3339),
 	}
 }

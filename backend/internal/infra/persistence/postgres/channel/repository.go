@@ -549,12 +549,13 @@ func (r *Repo) applyModelListRouteMetadata(ctx context.Context, items []ModelLis
 	type routeMetadataRow struct {
 		PlatformModelID uint
 		Protocol        string
+		UpstreamID      uint
 		UpstreamName    string
 	}
 	rows := make([]routeMetadataRow, 0)
 	if err := r.db.WithContext(ctx).
 		Table("llm_model_routes AS r").
-		Select("DISTINCT r.platform_model_id, r.protocol, u.name AS upstream_name").
+		Select("DISTINCT r.platform_model_id, r.protocol, u.id AS upstream_id, u.name AS upstream_name").
 		Joins("JOIN llm_upstream_models um ON um.id = r.upstream_model_id").
 		Joins("JOIN llm_upstreams u ON u.id = um.upstream_id").
 		Where("r.platform_model_id IN ? AND r.status = ? AND um.status = ? AND u.status = ?", modelIDs, "active", "active", "active").
@@ -565,6 +566,12 @@ func (r *Repo) applyModelListRouteMetadata(ctx context.Context, items []ModelLis
 
 	protocolsByModelID := make(map[uint]map[string]struct{})
 	upstreamNamesByModelID := make(map[uint]map[string]struct{})
+	// primaryUpstreamByModelID tracks the first (lowest ID) upstream seen per model.
+	type primaryUpstream struct {
+		id   uint
+		name string
+	}
+	primaryUpstreamByModelID := make(map[uint]primaryUpstream)
 	for _, row := range rows {
 		protocol := strings.TrimSpace(row.Protocol)
 		if protocol != "" {
@@ -580,6 +587,12 @@ func (r *Repo) applyModelListRouteMetadata(ctx context.Context, items []ModelLis
 				upstreamNamesByModelID[row.PlatformModelID] = make(map[string]struct{})
 			}
 			upstreamNamesByModelID[row.PlatformModelID][upstreamName] = struct{}{}
+		}
+
+		if row.UpstreamID > 0 && upstreamName != "" {
+			if existing, ok := primaryUpstreamByModelID[row.PlatformModelID]; !ok || row.UpstreamID < existing.id {
+				primaryUpstreamByModelID[row.PlatformModelID] = primaryUpstream{id: row.UpstreamID, name: upstreamName}
+			}
 		}
 
 	}
@@ -606,6 +619,15 @@ func (r *Repo) applyModelListRouteMetadata(ctx context.Context, items []ModelLis
 			return err
 		}
 		items[index].UpstreamNamesJSON = string(payload)
+	}
+	for modelID, primary := range primaryUpstreamByModelID {
+		index, ok := indexByModelID[modelID]
+		if !ok {
+			continue
+		}
+		id := primary.id
+		items[index].PrimaryUpstreamID = &id
+		items[index].PrimaryUpstreamName = primary.name
 	}
 	return nil
 }

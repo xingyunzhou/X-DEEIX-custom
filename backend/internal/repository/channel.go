@@ -150,14 +150,16 @@ type ChannelUpstreamListRow struct {
 // ChannelModelListRow 定义模型列表查询结果。
 type ChannelModelListRow struct {
 	domainchannel.PlatformModel
-	VendorName        string
-	VendorIcon        string
-	DisplayGroupName  string
-	DisplayGroupIcon  string
-	SourceCount       int64
-	ActiveSourceCount int64
-	ProtocolsJSON     string
-	UpstreamNamesJSON string
+	VendorName          string
+	VendorIcon          string
+	DisplayGroupName    string
+	DisplayGroupIcon    string
+	SourceCount         int64
+	ActiveSourceCount   int64
+	ProtocolsJSON       string
+	UpstreamNamesJSON   string
+	PrimaryUpstreamID   *uint
+	PrimaryUpstreamName string
 }
 
 // ListModelVendorsInput 定义技术厂商目录查询条件。
