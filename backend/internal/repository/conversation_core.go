@@ -1,0 +1,259 @@
+package repository
+
+import (
+	"context"
+	"time"
+
+	domainconversation "github.com/DEEIX-AI/DEEIX-Chat/backend/internal/domain/conversation"
+	domainuser "github.com/DEEIX-AI/DEEIX-Chat/backend/internal/domain/user"
+)
+
+// MessageUsageUpdate 定义消息 token 用量更新字段。
+type MessageUsageUpdate struct {
+	InputTokens      int64
+	OutputTokens     int64
+	CacheReadTokens  int64
+	CacheWriteTokens int64
+	ReasoningTokens  int64
+}
+
+// AssistantMessageCompletionUpdate 定义助手消息完成态更新字段。
+type AssistantMessageCompletionUpdate struct {
+	// AppendGeneratedContent preserves usage and existing content during artifact recovery.
+	AppendGeneratedContent bool
+	RequireIncomplete      bool
+	ContentType            string
+	Content                string
+	ReasoningContent       string
+	InputTokens            int64
+	OutputTokens           int64
+	CacheReadTokens        int64
+	CacheWriteTokens       int64
+	ReasoningTokens        int64
+	LatencyMS              int64
+	Status                 string
+	ErrorCode              string
+	ErrorMessage           string
+	KnowledgeSources       []domainconversation.MessageKnowledgeSource
+}
+
+// ForkConversationMessage 描述 fork 时待创建的消息及其源消息关系。
+// Message 仅承载新消息字段；父子关系通过源消息 ID 在事务内重建。
+type ForkConversationMessage struct {
+	SourceMessageID       uint
+	SourceParentMessageID *uint
+	Message               domainconversation.Message
+}
+
+// CreateForkedConversationInput 描述一次原子 fork 写入。
+type CreateForkedConversationInput struct {
+	SourceConversationID uint
+	Conversation         *domainconversation.Conversation
+	Messages             []ForkConversationMessage
+}
+
+// ConversationForkRepository 封装新会话、消息链和附件引用的原子复制能力。
+type ConversationForkRepository interface {
+	CreateForkedConversation(ctx context.Context, input CreateForkedConversationInput) error
+}
+
+// ConversationMetadataPatch 定义自动生成会话元数据的更新字段。
+type ConversationMetadataPatch struct {
+	Title             string
+	ReplaceableTitles []string
+}
+
+// ConversationRunPatch 定义会话运行日志的更新字段（群组重试/放弃推进顶层运行行）。
+type ConversationRunPatch struct {
+	Status           *string
+	ErrorCode        *string
+	ErrorMessage     *string
+	EndedAt          *time.Time
+	InputTokens      *int64
+	OutputTokens     *int64
+	CacheReadTokens  *int64
+	CacheWriteTokens *int64
+	ReasoningTokens  *int64
+	ToolCallsCount   *int
+}
+
+// DeleteConversationProjectOptions controls deletion of project-owned records.
+type DeleteConversationProjectOptions struct {
+	DeleteConversations bool
+	DeleteFiles         bool
+}
+
+// ConversationMetadataRepository 封装会话元信息与用户访问能力。
+type ConversationMetadataRepository interface {
+	CreateConversation(ctx context.Context, item *domainconversation.Conversation) error
+	ListConversationsByUser(ctx context.Context, userID uint, offset int, limit int, statusFilter string, starredFilter string, shareFilter string, projectFilter string, searchQuery string) ([]domainconversation.Conversation, int64, error)
+	ListConversationsForSearch(ctx context.Context, userID uint, offset int, limit int, searchQuery string) ([]domainconversation.Conversation, error)
+	GetConversationByUser(ctx context.Context, conversationID uint, userID uint) (*domainconversation.Conversation, error)
+	GetConversationByPublicID(ctx context.Context, publicID string, userID uint) (*domainconversation.Conversation, error)
+	CreateConversationProject(ctx context.Context, item *domainconversation.ConversationProject) error
+	ListConversationProjects(ctx context.Context, userID uint, statusFilter string) ([]domainconversation.ConversationProject, error)
+	GetConversationProjectByPublicID(ctx context.Context, userID uint, publicID string) (*domainconversation.ConversationProject, error)
+	UpdateConversationProjectMetadataByPublicID(ctx context.Context, userID uint, publicID string, patch domainconversation.ConversationProjectPatch) (*domainconversation.ConversationProject, error)
+	DeleteConversationProjectByPublicID(ctx context.Context, userID uint, publicID string, options DeleteConversationProjectOptions) ([]string, error)
+	ReorderConversationProjects(ctx context.Context, userID uint, publicIDs []string) error
+	UpdateConversationProjectAssignmentByPublicID(ctx context.Context, userID uint, conversationPublicID string, projectID *uint) (*domainconversation.Conversation, error)
+	BatchUpdateConversationProjectByPublicIDs(ctx context.Context, userID uint, conversationPublicIDs []string, projectID *uint) (int64, error)
+	CreateConversationRole(ctx context.Context, item *domainconversation.ConversationRole) error
+	ListConversationRoles(ctx context.Context, userID uint, statusFilter string) ([]domainconversation.ConversationRole, error)
+	GetConversationRoleByPublicID(ctx context.Context, userID uint, publicID string) (*domainconversation.ConversationRole, error)
+	UpdateConversationRoleByPublicID(ctx context.Context, userID uint, publicID string, patch domainconversation.ConversationRolePatch) (*domainconversation.ConversationRole, error)
+	DeleteConversationRoleByPublicID(ctx context.Context, userID uint, publicID string) error
+	ReorderConversationRoles(ctx context.Context, userID uint, publicIDs []string) error
+	GetActiveConversationShareByConversation(ctx context.Context, userID uint, conversationID uint) (*domainconversation.ConversationShare, error)
+	GetLatestConversationShareByConversation(ctx context.Context, userID uint, conversationID uint) (*domainconversation.ConversationShare, error)
+	GetActiveConversationShareByShareID(ctx context.Context, shareID string) (*domainconversation.ConversationShare, *domainconversation.Conversation, error)
+	CreateConversationShare(ctx context.Context, item *domainconversation.ConversationShare) error
+	ReplaceActiveConversationShare(ctx context.Context, item *domainconversation.ConversationShare) error
+	RevokeActiveConversationShares(ctx context.Context, userID uint, conversationIDs []uint) error
+	TouchConversationShareAccess(ctx context.Context, shareID string, accessedAt time.Time) error
+	UpdateConversationTitleByPublicID(ctx context.Context, userID uint, publicID string, title string) (*domainconversation.Conversation, error)
+	UpdateConversationSystemPromptByPublicID(ctx context.Context, userID uint, publicID string, systemPrompt string) (*domainconversation.Conversation, error)
+	UpdateConversationMetadata(ctx context.Context, conversationID uint, patch ConversationMetadataPatch) (*domainconversation.Conversation, error)
+	UpdateConversationLabelsByPublicID(ctx context.Context, userID uint, publicID string, labelsJSON string) (*domainconversation.Conversation, error)
+	SetGeneratedConversationLabelsIfEligible(ctx context.Context, conversationID uint, labelsJSON string) (*domainconversation.Conversation, bool, error)
+	UpdateConversationStarByPublicID(ctx context.Context, userID uint, publicID string, starred bool) (*domainconversation.Conversation, error)
+	UpdateConversationArchiveByPublicID(ctx context.Context, userID uint, publicID string, archived bool) (*domainconversation.Conversation, error)
+	DeleteConversationByPublicID(ctx context.Context, userID uint, publicID string, deleteFiles bool) ([]string, error)
+	GetUserByID(ctx context.Context, userID uint) (*domainuser.User, error)
+	IncrementMessageCount(ctx context.Context, conversationID uint, delta int) error
+	UpdateConversationLastResponseID(ctx context.Context, conversationID uint, responseID string) error
+	UpdateConversationStatefulResponse(ctx context.Context, conversationID uint, responseID string, promptFingerprint string) error
+	MarkConversationReadByPublicID(ctx context.Context, userID uint, publicID string) (*domainconversation.Conversation, error)
+	UpdateConversationModel(ctx context.Context, conversationID uint, platformModelName string, provider string) error
+	ListAllConversationsAfterID(ctx context.Context, afterID uint, limit int) ([]domainconversation.Conversation, error)
+	ListUserConversationsAfterID(ctx context.Context, userID uint, afterID uint, limit int) ([]domainconversation.Conversation, error)
+}
+
+// MessageRepository 封装消息读写能力。
+type MessageRepository interface {
+	CreateMessage(ctx context.Context, item *domainconversation.Message) error
+	CreateAssistantBranchMessage(ctx context.Context, assistantMessage *domainconversation.Message) error
+	CreateMessagePairWithUserAttachments(ctx context.Context, userMessage *domainconversation.Message, assistantMessage *domainconversation.Message, userAttachments []domainconversation.Attachment) error
+	CompleteAssistantMessageWithAttachments(ctx context.Context, userMessageID uint, userUsage MessageUsageUpdate, assistantMessageID uint, assistantCompletion AssistantMessageCompletionUpdate, assistantAttachments []domainconversation.Attachment) error
+	CompleteAssistantMessageWithGeneratedAttachments(ctx context.Context, assistantMessageID uint, assistantCompletion AssistantMessageCompletionUpdate, assistantAttachments []domainconversation.Attachment) error
+	GetMessageByPublicID(ctx context.Context, conversationID uint, userID uint, publicID string) (*domainconversation.Message, error)
+	GetMessageByPublicIDForUser(ctx context.Context, userID uint, publicID string) (*domainconversation.Message, error)
+	UpdateMessageUsage(ctx context.Context, messageID uint, inputTokens int64, outputTokens int64, cacheReadTokens int64, cacheWriteTokens int64, reasoningTokens int64) error
+	UpdateMessageState(ctx context.Context, messageID uint, status string, errorCode string, errorMessage string) error
+	UpdateUserMessageContent(ctx context.Context, messageID uint, conversationID uint, userID uint, content string) error
+	UpdateAssistantMessageContent(ctx context.Context, userID uint, publicID string, content string, editedAt time.Time) (*domainconversation.Message, error)
+	DeleteMessageByPublicID(ctx context.Context, userID uint, publicID string) (int64, error)
+	DeleteMessageAndReparentChildren(ctx context.Context, userID uint, conversationID uint, messageID uint) (int64, error)
+	UpdateMessageContent(ctx context.Context, userID uint, publicID string, content string, editedAt time.Time) (*domainconversation.Message, error)
+	CancelPendingGenerationMessagesByRunID(ctx context.Context, userID uint, runID string, errorCode string, errorMessage string) (bool, error)
+	InterruptPendingAssistantMessageByRunID(ctx context.Context, userID uint, runID string, errorCode string, errorMessage string) (bool, error)
+	UpdateAssistantMessageCompletion(ctx context.Context, messageID uint, update AssistantMessageCompletionUpdate) error
+	UpdateMessageBilling(ctx context.Context, messageID uint, billedCurrency string, billedNanousd int64, pricingSnapshot string) error
+	SumMessageTokens(ctx context.Context, conversationID uint) (int64, error)
+	ListMessages(ctx context.Context, conversationID uint, offset int, limit int) ([]domainconversation.Message, int64, error)
+	ListMessagesBeforeID(ctx context.Context, conversationID uint, beforeID uint, limit int) ([]domainconversation.Message, int64, error)
+	ListAllMessages(ctx context.Context, conversationID uint) ([]domainconversation.Message, error)
+	ListMessagesForShare(ctx context.Context, conversationID uint, publicIDs []string) ([]domainconversation.Message, error)
+	ListRecentMessages(ctx context.Context, conversationID uint, limit int) ([]domainconversation.Message, int64, error)
+	GetMessageByID(ctx context.Context, conversationID uint, messageID uint) (*domainconversation.Message, error)
+	GetLatestMessage(ctx context.Context, conversationID uint) (*domainconversation.Message, error)
+	ListMessageAncestors(ctx context.Context, conversationID uint, leafMessageID uint, maxDepth int) ([]domainconversation.Message, error)
+	ListLatestBranchPreviewMessages(ctx context.Context, conversationID uint, maxDepth int, limit int) ([]domainconversation.Message, error)
+	ListMessageAncestorsUntil(ctx context.Context, conversationID uint, leafMessageID uint, stopMessageID uint, maxDepth int) ([]domainconversation.Message, bool, error)
+}
+
+// MessageFeedbackRepository 封装消息反馈能力。
+type MessageFeedbackRepository interface {
+	UpsertMessageFeedback(ctx context.Context, item *domainconversation.MessageFeedback) error
+	DeleteMessageFeedback(ctx context.Context, userID uint, messageID uint) error
+	GetUserMessageFeedbackMap(ctx context.Context, userID uint, messageIDs []uint) (map[uint]string, error)
+	GetMessageFeedbackCounts(ctx context.Context, messageIDs []uint) (map[uint]map[string]int64, error)
+}
+
+// ConversationTraceRepository 封装附件、运行轨迹与工具调用能力。
+type ConversationTraceRepository interface {
+	SaveMessageToolHistory(ctx context.Context, userID, conversationID, messageID uint, runID, payload string) error
+	ListMessageToolHistories(ctx context.Context, userID uint, messageIDs []uint) (map[uint]string, error)
+	CreateAttachments(ctx context.Context, items []domainconversation.Attachment) error
+	CreateConversationRun(ctx context.Context, item *domainconversation.Run) error
+	// EnsureConversationRun inserts a mid-flight run row if absent (moderation / recovery).
+	EnsureConversationRun(ctx context.Context, item *domainconversation.Run) error
+	// UpsertConversationRun creates or updates the final run snapshot by run_id.
+	UpsertConversationRun(ctx context.Context, item *domainconversation.Run) error
+	// GetConversationRunByRunID 按运行 ID 读取当前用户的运行记录；不存在返回 ErrNotFound。
+	GetConversationRunByRunID(ctx context.Context, userID uint, runID string) (*domainconversation.Run, error)
+	// FindAssistantMessageIDByRunID 定位当前用户某次运行中的 assistant 消息；不存在返回 0。
+	FindAssistantMessageIDByRunID(ctx context.Context, userID uint, runID string) (uint, error)
+	UpsertConversationMessageTrace(ctx context.Context, item *domainconversation.MessageTrace) error
+	ListConversationMessageTracesByMessageIDs(ctx context.Context, messageIDs []uint) ([]domainconversation.MessageTrace, error)
+	UpsertConversationMessageTraceEvent(ctx context.Context, item *domainconversation.MessageTraceEventRow) error
+	ListConversationMessageTraceEventsByMessageIDs(ctx context.Context, messageIDs []uint) ([]domainconversation.MessageTraceEventRow, error)
+	CreateConversationToolCall(ctx context.Context, item *domainconversation.ToolCall) error
+	CreateConversationToolCalls(ctx context.Context, items []domainconversation.ToolCall) error
+	UpdateConversationToolCallPayload(ctx context.Context, userID uint, conversationID uint, runID string, item domainconversation.ToolCall) error
+	ListConversationToolCallsByMessageIDs(ctx context.Context, messageIDs []uint) ([]domainconversation.ToolCall, error)
+	ListConversationToolCallsByRunID(ctx context.Context, userID uint, conversationID uint, runID string) ([]domainconversation.ToolCall, error)
+	// ListConversationToolCallsByRunIDPrefix 按运行 ID 前缀查询工具调用行（EventScope=tool_call），
+	// 供群组重试时重建工具幂等账本（同一逻辑步骤的全部尝试共享前缀）。
+	ListConversationToolCallsByRunIDPrefix(ctx context.Context, userID uint, conversationID uint, runIDPrefix string) ([]domainconversation.ToolCall, error)
+	ListConversationRuns(ctx context.Context, userID uint, conversationID uint, offset int, limit int) ([]domainconversation.Run, int64, error)
+	ListConversationRunsByRunIDs(ctx context.Context, userID uint, conversationID uint, runIDs []string) ([]domainconversation.Run, error)
+	ListConversationRunStatusesByRunIDs(ctx context.Context, userID uint, runIDs []string) ([]domainconversation.RunStatus, error)
+	// UpdateConversationRun 按运行 ID 更新会话运行快照字段（群组重试/放弃时推进顶层运行行）。
+	PatchConversationRun(ctx context.Context, userID uint, conversationID uint, runID string, patch ConversationRunPatch) (*domainconversation.Run, error)
+	// UpdateConversationRun updates an existing owned snapshot without inserting or transferring ownership.
+	UpdateConversationRun(ctx context.Context, item *domainconversation.Run) error
+	ListConversationEventLogs(ctx context.Context, filter ConversationEventLogListFilter, offset int, limit int) ([]domainconversation.EventLog, int64, error)
+	GetConversationEventLog(ctx context.Context, eventID uint) (*domainconversation.EventLog, error)
+	GetConversationToolCallDetail(ctx context.Context, userID uint, runID string, toolCallID string) (*domainconversation.ToolCallDetail, error)
+}
+
+// ConversationEventLogListFilter 描述管理员对话事件列表筛选和排序条件。
+type ConversationEventLogListFilter struct {
+	Query          string
+	EventScope     string
+	EventType      string
+	Status         string
+	UserID         uint
+	ConversationID uint
+	CreatedFrom    *time.Time
+	CreatedTo      *time.Time
+	Sort           string
+}
+
+// MessageEmbeddingRepository 封装消息历史向量存储与检索能力。
+type MessageEmbeddingRepository interface {
+	UpsertMessageChunks(ctx context.Context, chunks []domainconversation.MessageChunk, embeddings [][]float32) error
+	SearchMessageChunks(ctx context.Context, input MessageChunkSearchInput) ([]domainconversation.MessageChunk, error)
+}
+
+// HistoricalMessageScope 描述当前消息所在分支中可参与历史召回的祖先范围。
+// ExcludeThroughMessageID 用于快照场景：排除该边界消息及其全部祖先。
+type HistoricalMessageScope struct {
+	ConversationID          uint
+	UserID                  uint
+	LeafMessageID           uint
+	ExcludeThroughMessageID uint
+}
+
+// Valid 表示分支范围包含可验证的会话和叶消息锚点。
+func (scope HistoricalMessageScope) Valid() bool {
+	return scope.ConversationID > 0 && scope.UserID > 0 && scope.LeafMessageID > 0
+}
+
+// MessageChunkSearchInput 描述当前分支内的历史消息语义检索。
+type MessageChunkSearchInput struct {
+	Scope              HistoricalMessageScope
+	QueryEmbedding     []float32
+	EmbeddingSignature string
+	TopK               int
+	MinSimilarity      float64
+}
+
+// CompactRepository 封装上下文压缩快照能力。
+type CompactRepository interface {
+	CreateContextSnapshot(ctx context.Context, item *domainconversation.ContextSnapshot) error
+	GetContextSnapshotByRunID(ctx context.Context, runID string) (*domainconversation.ContextSnapshot, error)
+	GetLatestContextSnapshot(ctx context.Context, conversationID uint) (*domainconversation.ContextSnapshot, error)
+	UpdateConversationCompactedAt(ctx context.Context, conversationID uint, compactedAt time.Time) error
+}

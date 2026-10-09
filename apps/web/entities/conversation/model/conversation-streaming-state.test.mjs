@@ -1,0 +1,76 @@
+import assert from "node:assert/strict";
+import { existsSync, readFileSync } from "node:fs";
+import test from "node:test";
+
+import { updateConversationStreamingOwner } from "./conversation-streaming-state.ts";
+
+const globalStyles = readFileSync(new URL("../../../app/globals.css", import.meta.url), "utf8");
+const sidebarConversationItem = readFileSync(
+  new URL("../../../features/layouts/components/navigation/sidebar-conversation-item.tsx", import.meta.url),
+  "utf8",
+);
+const recentList = readFileSync(
+  new URL("../../../features/recent/components/sections/recent-list.tsx", import.meta.url),
+  "utf8",
+);
+
+test("a conversation remains streaming until its final run owner finishes", () => {
+  const owners = new Map();
+
+  assert.equal(updateConversationStreamingOwner(owners, "conversation-1", "run-1", true), true);
+  assert.equal(updateConversationStreamingOwner(owners, "conversation-1", "run-2", true), true);
+  assert.equal(updateConversationStreamingOwner(owners, "conversation-1", "run-1", false), true);
+  assert.equal(updateConversationStreamingOwner(owners, "conversation-1", "run-2", false), false);
+});
+
+test("run owners are isolated by conversation", () => {
+  const owners = new Map();
+
+  updateConversationStreamingOwner(owners, "conversation-1", "run-1", true);
+  updateConversationStreamingOwner(owners, "conversation-2", "run-2", true);
+
+  assert.equal(updateConversationStreamingOwner(owners, "conversation-1", "run-1", false), false);
+  assert.equal(owners.has("conversation-2"), true);
+});
+
+test("streaming titles sweep only their text while unread dots remain completion-only", () => {
+  const sweepStyles = globalStyles.slice(
+    globalStyles.indexOf("@supports ((background-clip: text)"),
+    globalStyles.indexOf("@keyframes trace-sweep-move"),
+  );
+
+  assert.match(globalStyles, /background-clip:\s*text/);
+  assert.match(globalStyles, /-webkit-text-fill-color:\s*transparent/);
+  assert.match(globalStyles, /animation:\s*trace-sweep-move/);
+  assert.match(globalStyles, /currentColor\s+0%[\s\S]*currentColor\s+100%/);
+  assert.match(sweepStyles, /rgb\(255\s+255\s+255\s*\/\s*98%\)/);
+  assert.doesNotMatch(sweepStyles, /var\(--primary\)/);
+  assert.match(globalStyles, /background-position:\s*100%\s+0[\s\S]*background-position:\s*0%\s+0/);
+  assert.doesNotMatch(globalStyles, /background-position:\s*(?:130%|-30%)\s+0/);
+  assert.doesNotMatch(globalStyles, /\.trace-sweep::after/);
+  assert.match(globalStyles, /prefers-reduced-motion:\s*reduce[\s\S]*\.trace-sweep[\s\S]*animation:\s*none/);
+
+  for (const source of [sidebarConversationItem, recentList]) {
+    assert.match(source, /item\.hasUnread\s*&&\s*!streaming/);
+    assert.match(source, /streaming\s*&&\s*"trace-sweep"/);
+  }
+});
+
+test("trace text masks never enclose scrollable group or tool content", (t) => {
+  const cases = [
+    ["../../../features/agent-groups/components/message-agent-group-trace.tsx", "AccordionItem"],
+    ["../../../features/chat/components/message/message-tool-trace.tsx", "li"],
+  ];
+  const available = cases.filter(([path]) => existsSync(new URL(path, import.meta.url)));
+  if (available.length === 0) {
+    t.skip("trace components are not part of this custom UI surface");
+    return;
+  }
+  for (const [path, container] of available) {
+    const source = readFileSync(new URL(path, import.meta.url), "utf8");
+    const openings = source.match(new RegExp(`<${container}\\b[\\s\\S]*?>`, "g")) ?? [];
+    assert.ok(openings.length > 0);
+    for (const opening of openings) assert.ok(!opening.includes('"trace-sweep"'), `${container} must not paint clipped descendant text`);
+    assert.match(source, /trace-sweep/);
+  }
+});

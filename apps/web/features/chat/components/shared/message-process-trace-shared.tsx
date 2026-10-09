@@ -1,0 +1,601 @@
+"use client";
+
+import { BookOpen, Brain, FileImage, FileText, LibraryBig, MessageSquareText, Wrench } from "lucide-react";
+import Link from "next/link";
+import * as React from "react";
+import { Image as ImageIcon } from "lucide-react";
+
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import type { ProcessTraceLabels } from "@/features/chat/hooks/use-process-trace-labels";
+import {
+  displayTraceStageLabel,
+  displayTraceTrigger,
+  type FileContextBadge,
+  filterProcessTraceStages,
+  isFileContextTraceStage,
+  isRAGTraceStage,
+  isTraceStageError,
+  localizeTraceDetailItems,
+  mergePromptTraceStage,
+  normalizeTraceListItem,
+  parseStructuredTraceStages,
+  parseTraceStages,
+  type RecalledEvidenceItem,
+  type TraceStage,
+} from "@/features/chat/model/message-process-trace";
+import type { ChatPromptTrace, ChatTraceBlock, RAGCitation } from "@/features/chat/types/messages";
+import { useLocalizedErrorMessage } from "@/i18n/use-localized-error";
+import { cn } from "@/lib/utils";
+import { getContextArtifact } from "@/shared/api/conversation";
+import type { ContextArtifactDTO } from "@/shared/api/conversation.types";
+import { resolveAccessToken } from "@/shared/auth/resolve-access-token";
+import { StreamdownRender } from "@/shared/components/markdown/streamdown-render";
+
+export const TRACE_ROOT_CLASS = "chat-screenshot-omit mb-2 w-full pr-4 sm:pr-6";
+
+function FileContextBadgeList({ badges }: { badges: FileContextBadge[] }) {
+  if (badges.length === 0) return null;
+  return (
+    <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+      {badges.map((item, index) => {
+        const className =
+          "inline-flex max-w-[180px] items-center gap-1 rounded-full border border-border/35 bg-background/45 px-1.5 py-0 text-[11px] leading-5 text-muted-foreground/76 transition-colors hover:border-border hover:text-foreground";
+        const content = (
+          <>
+            <span className="truncate font-medium">{item.name}</span>
+            <span className="shrink-0 text-muted-foreground/50">{item.label}</span>
+          </>
+        );
+        const tooltip = (
+          <TooltipContent side="top" className="max-w-[320px] break-words">
+            <div className="space-y-1">
+              <div className="font-medium text-background">{item.name}</div>
+              {item.description ? <div>{item.description}</div> : null}
+            </div>
+          </TooltipContent>
+        );
+        if (item.fileID) {
+          return (
+            <Tooltip key={`${item.fileID}-${item.label}-${index}`}>
+              <TooltipTrigger asChild>
+                <Link
+                  href={`/files?file=${encodeURIComponent(item.fileID)}&tab=${item.tab}`}
+                  className={className}
+                >
+                  {content}
+                </Link>
+              </TooltipTrigger>
+              {tooltip}
+            </Tooltip>
+          );
+        }
+        return (
+          <Tooltip key={`${item.name}-${item.label}-${index}`}>
+            <TooltipTrigger asChild>
+              <span className={className}>{content}</span>
+            </TooltipTrigger>
+            {tooltip}
+          </Tooltip>
+        );
+      })}
+    </div>
+  );
+}
+
+type GroupedRAGCitation = {
+  fileID: string;
+  fileName: string;
+  chunkCount: number;
+  sharePercent: number;
+  maxScore: number;
+  previews: string[];
+  imageMatch: boolean;
+};
+
+function groupRAGCitations(citations: RAGCitation[], labels: ProcessTraceLabels): GroupedRAGCitation[] {
+  if (citations.length === 0) return [];
+  const grouped = new Map<string, GroupedRAGCitation>();
+  for (const item of citations) {
+    const fileID = item.file_id?.trim() || "unknown";
+    const fileName = item.file_name?.trim() || labels.rag.sourceFallback(fileID);
+    const current = grouped.get(fileID) ?? {
+      fileID,
+      fileName,
+      chunkCount: 0,
+      sharePercent: 0,
+      maxScore: 0,
+      previews: [],
+      imageMatch: false,
+    };
+    current.chunkCount += 1;
+    if (item.modality === "image") {
+      current.imageMatch = true;
+    }
+    current.maxScore = Math.max(current.maxScore, item.score || 0);
+    const preview = item.preview
+      ?.replace(/\s+/g, " ")
+      .replace(/\.{4,}/g, "…")
+      .replace(/…{2,}/g, "…")
+      .trim();
+    if (preview && !current.previews.includes(preview)) {
+      current.previews.push(preview);
+    }
+    grouped.set(fileID, current);
+  }
+  const total = citations.length;
+  return Array.from(grouped.values())
+    .map((item) => ({
+      ...item,
+      sharePercent: total > 0 ? Math.round((item.chunkCount / total) * 100) : 0,
+    }))
+    .sort((left, right) => {
+      if (right.chunkCount !== left.chunkCount) return right.chunkCount - left.chunkCount;
+      return right.maxScore - left.maxScore;
+    });
+}
+
+export function RAGCitationList({
+  citations,
+  embedded = false,
+  labels,
+  className,
+  showScores = true,
+}: {
+  citations: RAGCitation[];
+  embedded?: boolean;
+  labels: ProcessTraceLabels;
+  className?: string;
+  showScores?: boolean;
+}) {
+  if (citations.length === 0) return null;
+  const grouped = groupRAGCitations(citations, labels);
+  if (embedded) {
+    return (
+      <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+        {grouped.map((item) => (
+          <span
+            key={item.fileID}
+            className="inline-flex max-w-[180px] items-center gap-1 rounded-full border border-border/35 bg-background/45 px-1.5 py-0 text-[11px] leading-5 text-muted-foreground/76"
+            title={item.previews.join("\n")}
+          >
+            {item.imageMatch ? <ImageIcon className="size-3 shrink-0 stroke-1" aria-label={labels.rag.imageMatch} /> : null}
+            <span className="truncate font-medium">{item.fileName}</span>
+            <span className="shrink-0 text-muted-foreground/50">
+              {labels.rag.chunksShort(item.chunkCount, Math.round(item.maxScore * 100))}
+            </span>
+          </span>
+        ))}
+      </div>
+    );
+  }
+  return (
+    <div className={cn("border-t border-border/25 pt-2", className)}>
+      <div className="mb-2 flex items-center justify-between gap-3 px-0.5">
+        <span className="text-[11px] font-medium text-foreground/72">{labels.rag.retrievalSources}</span>
+        <span className="text-[10px] text-muted-foreground/50">{labels.rag.chunksTotal(citations.length)}</span>
+      </div>
+
+      <div className="space-y-3">
+        {grouped.map((item) => {
+          const itemMeta = showScores
+            ? labels.rag.chunksShort(item.chunkCount, Math.round(item.maxScore * 100))
+            : grouped.length > 1
+              ? labels.rag.chunksTotal(item.chunkCount)
+              : null;
+          return (
+            <div key={item.fileID}>
+              <div className="flex min-w-0 items-center justify-between gap-3 px-0.5">
+                <div className="flex min-w-0 items-center gap-2">
+                  <span className="size-1 shrink-0 rounded-full bg-foreground/40" aria-hidden="true" />
+                  {item.imageMatch ? <ImageIcon className="size-3 shrink-0 stroke-1 text-muted-foreground/70" aria-label={labels.rag.imageMatch} /> : null}
+                  <div className="truncate text-[11px] font-medium text-foreground/82" title={item.fileName}>{item.fileName}</div>
+                </div>
+                {itemMeta ? <span className="shrink-0 text-[10px] text-muted-foreground/50">{itemMeta}</span> : null}
+              </div>
+              {item.previews.length > 0 ? (
+                <div className="mt-1.5 divide-y divide-border/20 overflow-hidden rounded-md bg-muted/25">
+                  {item.previews.slice(0, 3).map((preview, index) => (
+                    <div key={`${item.fileID}-${index}`} className="px-2.5 py-2">
+                      <p
+                        className="line-clamp-2 text-[10px] leading-4 text-muted-foreground/68"
+                        title={preview}
+                      >
+                        {preview}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              ) : item.imageMatch ? (
+                <p className="mt-1.5 px-2.5 text-[10px] leading-4 text-muted-foreground/55">{labels.rag.imageMatch}</p>
+              ) : null}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function recalledSourceIcon(kind: RecalledEvidenceItem["kind"]) {
+  switch (kind) {
+    case "skill":
+      return BookOpen;
+    case "tool":
+      return Wrench;
+    case "card":
+      return LibraryBig;
+    case "memory":
+      return MessageSquareText;
+    case "recall":
+      return Brain;
+    case "image":
+      return FileImage;
+    default:
+      return FileText;
+  }
+}
+
+type RecalledEvidenceDialogState =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "ready"; artifact: ContextArtifactDTO }
+  | { status: "error"; message: string };
+
+// RecalledEvidenceDialog 展示被召回证据的 artifact 内容：点击卡片后按 artifactID 拉取详情。
+function RecalledEvidenceDialog({
+  item,
+  open,
+  onOpenChange,
+  labels,
+}: {
+  item: RecalledEvidenceItem | null;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  labels: ProcessTraceLabels;
+}) {
+  const resolveErrorMessage = useLocalizedErrorMessage();
+  const [state, setState] = React.useState<RecalledEvidenceDialogState>({ status: "idle" });
+  const artifactID = item?.artifactID;
+  const sessionExpired = labels.recalled.sessionExpired;
+  const loadFailed = labels.recalled.loadFailed;
+
+  React.useEffect(() => {
+    if (!open || !artifactID) {
+      return undefined;
+    }
+    let cancelled = false;
+    setState({ status: "loading" });
+    void (async () => {
+      try {
+        const token = await resolveAccessToken();
+        if (!token) {
+          throw new Error(sessionExpired);
+        }
+        const artifact = await getContextArtifact(token, artifactID);
+        if (cancelled) {
+          return;
+        }
+        setState({ status: "ready", artifact });
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+        setState({ status: "error", message: resolveErrorMessage(error, loadFailed) });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [artifactID, loadFailed, open, resolveErrorMessage, sessionExpired]);
+
+  const title = state.status === "ready" ? state.artifact.sourceTitle || item?.title || "" : item?.title || "";
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="flex min-w-0 max-h-[calc(100svh-2rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-[560px]">
+        <div className="min-w-0 flex-1 space-y-3 overflow-y-auto p-5 pb-4">
+          <DialogHeader>
+            <DialogTitle className="break-words">{title}</DialogTitle>
+            {state.status === "ready" ? (
+              <DialogDescription>
+                {state.artifact.kind}
+                {state.artifact.score > 0 ? ` · ${Math.round(state.artifact.score * 100)}%` : ""}
+              </DialogDescription>
+            ) : null}
+          </DialogHeader>
+          {state.status === "loading" ? (
+            <div className="flex items-center gap-2 py-2 text-[12px] text-muted-foreground/62">
+              <span className="inline-block size-3.5 animate-spin rounded-full border-2 border-muted border-t-foreground/50" />
+              {labels.recalled.loading}
+            </div>
+          ) : null}
+          {state.status === "error" ? (
+            <p className="text-[12px] leading-5 text-destructive/85">{state.message}</p>
+          ) : null}
+          {state.status === "ready" ? (
+            <pre className="max-h-[55vh] min-w-0 overflow-y-auto overflow-x-hidden rounded-md bg-muted/45 px-4 py-3 text-[12px] leading-6 whitespace-pre-wrap break-words text-foreground [overflow-wrap:anywhere]">
+              <code>{state.artifact.content}</code>
+            </pre>
+          ) : null}
+        </div>
+        <DialogFooter className="shrink-0 border-t border-border/60 px-5 py-3">
+          <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>
+            {labels.recalled.close}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function RecalledEvidenceCard({
+  item,
+  onClick,
+  labels,
+}: {
+  item: RecalledEvidenceItem;
+  onClick?: () => void;
+  labels: ProcessTraceLabels;
+}) {
+  const Icon = recalledSourceIcon(item.kind);
+  const typeLabel = labels.recalled.types[item.kind];
+  const className = cn(
+    "inline-flex min-w-0 max-w-[220px] items-center gap-2 rounded-md border border-border/45 bg-background/60 px-2 py-1.5 text-left text-[11px] leading-4 text-muted-foreground transition-colors",
+    onClick ? "cursor-pointer hover:border-border hover:bg-accent/35 hover:text-foreground" : "",
+  );
+  const content = (
+    <>
+      <span className="flex size-6 shrink-0 items-center justify-center rounded-sm bg-muted/70 text-muted-foreground">
+        <Icon className="size-3.5" />
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block text-[10px] leading-3 text-muted-foreground/60">{typeLabel}</span>
+        <span className="block truncate font-medium text-foreground/85">{item.title}</span>
+      </span>
+      {item.score != null ? (
+        <span className="shrink-0 text-[10px] text-muted-foreground/55">{Math.round(item.score * 100)}%</span>
+      ) : null}
+    </>
+  );
+  if (onClick) {
+    return (
+      <button type="button" className={className} title={item.title} onClick={onClick}>
+        {content}
+      </button>
+    );
+  }
+  return (
+    <span className={className} title={item.title}>
+      {content}
+    </span>
+  );
+}
+
+// RecalledEvidenceList 在过程轨迹正文底部渲染本轮被召回的上下文证据卡片。
+function RecalledEvidenceList({
+  items,
+  labels,
+}: {
+  items: RecalledEvidenceItem[];
+  labels: ProcessTraceLabels;
+}) {
+  const [openItem, setOpenItem] = React.useState<RecalledEvidenceItem | null>(null);
+  if (items.length === 0) {
+    return null;
+  }
+  return (
+    <div className="border-t border-border/30 pt-2">
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <span className="text-[11px] font-medium text-muted-foreground/76">{labels.recalled.title}</span>
+        <span className="text-[10px] text-muted-foreground/56">{labels.recalled.count(items.length)}</span>
+      </div>
+      <div className="flex flex-wrap gap-1.5">
+        {items.map((item) => (
+          <RecalledEvidenceCard
+            key={`${item.sourceType}-${item.sourceID}-${item.title}`}
+            item={item}
+            labels={labels}
+            onClick={
+              typeof item.artifactID === "number" && item.artifactID > 0 ? () => setOpenItem(item) : undefined
+            }
+          />
+        ))}
+      </div>
+      <RecalledEvidenceDialog
+        item={openItem}
+        open={openItem !== null}
+        onOpenChange={(next) => {
+          if (!next) {
+            setOpenItem(null);
+          }
+        }}
+        labels={labels}
+      />
+    </div>
+  );
+}
+
+function StreamingTraceText({
+  text,
+  active,
+  className,
+}: {
+  text: string;
+  active: boolean;
+  className?: string;
+}) {
+  const chars = React.useMemo(() => Array.from(text), [text]);
+  const [visibleCount, setVisibleCount] = React.useState(() => (active ? 0 : chars.length));
+
+  React.useEffect(() => {
+    if (!active) {
+      setVisibleCount(chars.length);
+      return;
+    }
+
+    setVisibleCount(0);
+    const timer = window.setInterval(() => {
+      setVisibleCount((current) => {
+        if (current >= chars.length) {
+          window.clearInterval(timer);
+          return chars.length;
+        }
+        return Math.min(chars.length, current + 2);
+      });
+    }, 18);
+
+    return () => window.clearInterval(timer);
+  }, [active, chars.length, text]);
+
+  return <span className={className}>{chars.slice(0, visibleCount).join("")}</span>;
+}
+
+function TraceStageRows({
+  stages,
+  streaming,
+  citations,
+  fileBadges,
+  payloadJson,
+  labels,
+}: {
+  stages: TraceStage[];
+  streaming: boolean;
+  citations: RAGCitation[];
+  fileBadges: FileContextBadge[];
+  payloadJson?: string;
+  labels: ProcessTraceLabels;
+}) {
+  return (
+    <ol className="space-y-0.5">
+      {stages.map((stage, index) => {
+        const isError = isTraceStageError(stage);
+        const activeStreamingStage = streaming && index === stages.length - 1;
+        const detailItems = stage.details.length > 0 ? stage.details : stage.detail ? [stage.detail] : [];
+        const displayDetailItems = localizeTraceDetailItems(stage, detailItems, payloadJson, labels);
+        const showCitations = isRAGTraceStage(stage) && citations.length > 0;
+        const showFileBadges = isFileContextTraceStage(stage) && fileBadges.length > 0;
+        return (
+          <li
+            key={`${stage.label}-${index}`}
+            className={cn(
+              "group/stage grid grid-cols-[0.875rem_8rem_minmax(0,1fr)] gap-x-5 gap-y-0.5 text-[12px] leading-5",
+              "max-sm:grid-cols-[0.875rem_minmax(0,1fr)] max-sm:gap-x-2",
+            )}
+          >
+            <div className="relative flex justify-center">
+              {index > 0 ? <span className="absolute -top-0.5 bottom-1/2 w-px bg-border/42" /> : null}
+              {index < stages.length - 1 ? <span className="absolute bottom-[-0.125rem] top-1/2 w-px bg-border/42" /> : null}
+              <span
+                className={cn(
+                  "relative z-10 mt-[0.45rem] size-1.5 rounded-full bg-muted-foreground/38 ring-4 ring-background transition-colors group-hover/stage:bg-foreground/58",
+                  isError && "bg-destructive/80",
+                )}
+              />
+            </div>
+            <div className="min-w-0 max-sm:col-start-2">
+              <span
+                className={cn(
+                  "block truncate font-medium text-muted-foreground/76 transition-colors group-hover/stage:text-foreground/88",
+                  isError && "text-destructive/85 group-hover/stage:text-destructive",
+                )}
+              >
+                {displayTraceStageLabel(stage.label, labels)}
+              </span>
+            </div>
+            <div className="min-w-0 space-y-0.5 pb-2 max-sm:col-start-2">
+              {stage.trigger ? (
+                <div className={cn("break-words text-[12px] leading-5 text-muted-foreground/58", isError && "text-destructive/65")}>
+                  {displayTraceTrigger(stage.trigger, labels)}
+                </div>
+              ) : null}
+              {displayDetailItems.map((detailText, detailIndex) => (
+                /^[-*]\s+/.test(detailText) ? (
+                  <div
+                    key={`${stage.label}-${index}-detail-${detailIndex}`}
+                    className={cn("flex min-w-0 gap-1.5 text-muted-foreground/84", isError && "text-destructive/80")}
+                  >
+                    <span className="mt-[0.45rem] size-1 shrink-0 rounded-full bg-current opacity-45" />
+                    <p className="min-w-0 whitespace-normal break-words">
+                      <StreamingTraceText text={normalizeTraceListItem(detailText)} active={activeStreamingStage} />
+                    </p>
+                  </div>
+                ) : (
+                  <p
+                    key={`${stage.label}-${index}-detail-${detailIndex}`}
+                    className={cn("min-w-0 whitespace-normal break-words text-muted-foreground/84", isError && "text-destructive/80")}
+                  >
+                    <StreamingTraceText text={detailText} active={activeStreamingStage} />
+                  </p>
+                )
+              ))}
+              {showFileBadges ? <FileContextBadgeList badges={fileBadges} /> : null}
+              {showCitations ? <RAGCitationList citations={citations} embedded labels={labels} /> : null}
+            </div>
+          </li>
+        );
+      })}
+    </ol>
+  );
+}
+
+export function TraceContent({
+  block,
+  streaming,
+  citations = [],
+  fileBadges = [],
+  promptTrace,
+  recalledItems = [],
+  labels,
+}: {
+  block: ChatTraceBlock;
+  streaming: boolean;
+  citations?: RAGCitation[];
+  fileBadges?: FileContextBadge[];
+  promptTrace?: ChatPromptTrace;
+  recalledItems?: RecalledEvidenceItem[];
+  labels: ProcessTraceLabels;
+}) {
+  const structuredStages = parseStructuredTraceStages(block.payloadJson, labels);
+  const parsedStages = structuredStages.length > 0 ? [] : parseTraceStages(block.contentMarkdown);
+  const stages = filterProcessTraceStages(mergePromptTraceStage(structuredStages.length > 0 ? structuredStages : parsedStages, promptTrace, labels));
+  if (stages.length > 0) {
+    return (
+      <>
+        <TraceStageRows
+          stages={stages}
+          streaming={streaming}
+          citations={citations}
+          fileBadges={fileBadges}
+          payloadJson={block.payloadJson}
+          labels={labels}
+        />
+        {recalledItems.length > 0 ? <RecalledEvidenceList items={recalledItems} labels={labels} /> : null}
+      </>
+    );
+  }
+  if (parsedStages.length > 0) {
+    return null;
+  }
+  if (!block.contentMarkdown.trim()) {
+    return null;
+  }
+
+  return (
+    <section className="text-[12px] leading-5 text-muted-foreground/84">
+      <StreamdownRender
+        content={block.contentMarkdown}
+        streaming={streaming}
+        variant="thinking"
+        className="[&_ul]:my-0 [&_ul]:space-y-0.5 [&_li]:pl-0 [&_li]:leading-5"
+      />
+    </section>
+  );
+}

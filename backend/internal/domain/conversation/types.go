@@ -1,0 +1,660 @@
+package conversation
+
+import "time"
+
+const (
+	ConversationProjectMCPDefaultModeInherit = "inherit"
+	ConversationProjectMCPDefaultModeCustom  = "custom"
+)
+
+// Conversation 表示会话元信息。
+type Conversation struct {
+	ID                     uint
+	UserID                 uint
+	ProjectID              *uint
+	RoleID                 *uint
+	AgentGroupID           *uint
+	ProjectPublicID        string
+	ProjectName            string
+	ProjectSystemPrompt    string
+	RolePublicID           string
+	RoleName               string
+	RoleSystemPrompt       string
+	AgentGroupPublicID     string
+	AgentGroupName         string
+	PublicID               string
+	Title                  string
+	LabelsJSON             string
+	LabelsManuallyManaged  bool
+	Model                  string
+	Provider               string
+	SessionKey             string
+	IsStarred              bool
+	StarredAt              *time.Time
+	MessageCount           int
+	Status                 string
+	ContextPolicy          string
+	LastCompactedAt        *time.Time
+	LastResponseID         string
+	LastPromptFingerprint  string
+	LastAssistantMessageID *uint
+	LastReadMessageID      *uint
+	ShareStatus            string
+	ShareID                string
+	SharedAt               *time.Time
+	LastShareAccessedAt    *time.Time
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
+	SystemPrompt           string
+}
+
+// ConversationProject 表示用户会话项目分组。
+type ConversationProject struct {
+	ID                      uint
+	UserID                  uint
+	PublicID                string
+	Name                    string
+	Description             string
+	SystemPrompt            string
+	DefaultModel            string
+	MCPDefaultMode          string
+	DefaultMCPToolIDs       []uint
+	DefaultSkillIDs         []uint
+	DefaultKnowledgeBaseIDs []string
+	Color                   string
+	Icon                    string
+	SortOrder               int
+	Status                  string
+	CreatedAt               time.Time
+	UpdatedAt               time.Time
+}
+
+// ConversationProjectPatch 表示项目分组的局部更新。
+type ConversationProjectPatch struct {
+	Name                    *string
+	Description             *string
+	SystemPrompt            *string
+	DefaultModel            *string
+	MCPDefaultMode          *string
+	DefaultMCPToolIDs       *[]uint
+	DefaultSkillIDs         *[]uint
+	DefaultKnowledgeBaseIDs *[]string
+	Color                   *string
+	Icon                    *string
+	Status                  *string
+}
+
+// ConversationRole 表示用户角色(助手)配置。
+// 角色 = 项目的全部能力 + 默认模型 + 图标。
+type ConversationRole struct {
+	ID           uint
+	UserID       uint
+	PublicID     string
+	Name         string
+	Description  string
+	SystemPrompt string
+	Model        string
+	Provider     string
+	// ReasoningEffort 是角色默认思考强度语义档位（""/low/medium/high/xhigh/max），空串=继承用户全局默认。
+	ReasoningEffort   string
+	MCPDefaultMode    string
+	DefaultMCPToolIDs []uint
+	DefaultSkillIDs   []uint
+	Color             string
+	Icon              string
+	GroupName         string
+	SortOrder         int
+	// PinnedAt 非空表示角色已置顶（按置顶先后排序）。
+	PinnedAt  *time.Time
+	Status    string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// ConversationRolePatch 表示角色的局部更新。
+type ConversationRolePatch struct {
+	Name              *string
+	Description       *string
+	SystemPrompt      *string
+	Model             *string
+	Provider          *string
+	ReasoningEffort   *string
+	MCPDefaultMode    *string
+	DefaultMCPToolIDs *[]uint
+	DefaultSkillIDs   *[]uint
+	Color             *string
+	Icon              *string
+	GroupName         *string
+	// Pinned true=置顶（记录当前时间）；false=取消置顶；nil=不变。
+	Pinned *bool
+	Status *string
+}
+
+// ConversationShare 表示会话公开分享快照。
+type ConversationShare struct {
+	ID                    uint
+	ShareID               string
+	ConversationID        uint
+	UserID                uint
+	Status                string
+	TitleSnapshot         string
+	ModelSnapshot         string
+	MessageIDsJSON        string
+	DefaultMessageIDsJSON string
+	RevokedAt             *time.Time
+	RegeneratedAt         *time.Time
+	LastAccessedAt        *time.Time
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
+}
+
+// MessageTraceBlock 表示单个消息轨迹块。
+type MessageTraceBlock struct {
+	StartedAt       time.Time
+	Title           string
+	Summary         string
+	ContentMarkdown string
+	Status          string
+	Stage           string
+	RoundID         string
+	ParentEventID   string
+	UpdatedAt       time.Time
+	PayloadJSON     string
+}
+
+// MessageTraceEvent 表示按发生顺序记录的消息轨迹事件。
+type MessageTraceEvent struct {
+	EventID         string
+	EventType       string
+	Phase           string
+	Stage           string
+	RoundID         string
+	ParentEventID   string
+	Title           string
+	Summary         string
+	ContentMarkdown string
+	Status          string
+	Seq             int
+	StartedAt       time.Time
+	EndedAt         *time.Time
+	UpdatedAt       time.Time
+	PayloadJSON     string
+}
+
+// MessageProcessTrace 表示消息处理、工具调用与上游 think 聚合结果。
+type MessageProcessTrace struct {
+	Enabled       bool
+	Status        string
+	Process       *MessageTraceBlock
+	Tools         *MessageTraceBlock
+	UpstreamThink *MessageTraceBlock
+	PromptTrace   *MessagePromptTrace
+	Events        []MessageTraceEvent
+}
+
+// MessagePromptTraceBlock 表示一次上游请求中的上下文规划块。
+type MessagePromptTraceBlock struct {
+	Kind          string
+	Title         string
+	TokenEstimate int64
+	Cacheable     bool
+	SourceCount   int
+	SourceRefs    []MessagePromptTraceSourceRef
+}
+
+// MessagePromptTraceSourceRef 表示 PromptTrace 中的上下文来源引用。
+type MessagePromptTraceSourceRef struct {
+	SourceType string
+	SourceID   string
+	Title      string
+	ArtifactID uint
+}
+
+// MessagePromptTrace 表示本轮请求发送前的 PromptPlan 摘要。
+type MessagePromptTrace struct {
+	Mode                   string
+	PromptFingerprint      string
+	StatefulUsed           bool
+	StatefulDisabledReason string
+	TotalTokenEstimate     int64
+	SentTokenEstimate      int64
+	FullMessageCount       int
+	SentMessageCount       int
+	StatefulSavedMessages  int
+	StatefulSavedTokens    int64
+	Blocks                 []MessagePromptTraceBlock
+}
+
+// MessageKnowledgeSource 表示消息生成时实际使用的知识来源。
+type MessageKnowledgeSource struct {
+	FileName   string
+	FileID     string
+	ChunkIndex int
+	Score      float32
+	Preview    string
+	Modality   string
+}
+
+// Message 表示会话消息。
+type Message struct {
+	ID                       uint
+	ConversationID           uint
+	UserID                   uint
+	PublicID                 string
+	ParentMessageID          *uint
+	RunID                    string
+	Role                     string
+	ContentType              string
+	Content                  string
+	ReasoningContent         string
+	BranchReason             string
+	SourceMessageID          *uint
+	TokenUsage               int64
+	InputTokens              int64
+	OutputTokens             int64
+	CacheReadTokens          int64
+	CacheWriteTokens         int64
+	ReasoningTokens          int64
+	LatencyMS                int64
+	BilledCurrency           string
+	BilledNanousd            int64
+	PricingSnapshot          string
+	Status                   string
+	ErrorCode                string
+	ErrorMessage             string
+	ModerationEventID        string
+	ModerationCategoriesJSON string
+	KnowledgeSources         []MessageKnowledgeSource
+	Attachments              string
+	ParentPublicID           string
+	SourcePublicID           string
+	MyFeedback               string
+	ThumbsUpCount            int64
+	ThumbsDownCount          int64
+	ProcessTrace             *MessageProcessTrace
+	EditedAt                 *time.Time
+	CreatedAt                time.Time
+	UpdatedAt                time.Time
+}
+
+// MessageFeedback 表示消息反馈。
+type MessageFeedback struct {
+	ID             uint
+	UserID         uint
+	ConversationID uint
+	MessageID      uint
+	Feedback       string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
+// Attachment 表示附件元信息。
+type Attachment struct {
+	ID             uint
+	ConversationID uint
+	MessageID      uint
+	UserID         uint
+	FileID         string
+	Kind           string
+	FileName       string
+	MimeType       string
+	FileSize       int64
+	SHA256         string
+	StoragePath    string
+	Status         string
+	MetaJSON       string
+	UploadedAt     time.Time
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
+// FileObject 表示文件对象。
+type FileObject struct {
+	ID                     uint
+	FileID                 string
+	UserID                 uint
+	Purpose                string
+	FileName               string
+	MimeType               string
+	DetectedMIME           string
+	FileCategory           string
+	SizeBytes              int64
+	SHA256                 string
+	StoragePath            string
+	Status                 string
+	LastAccessedAt         *time.Time
+	ExpiresAt              *time.Time
+	ProcessingStatus       string
+	ProcessingReady        bool
+	ProcessingErrorCode    string
+	ProcessingErrorMessage string
+	ExtractStatus          string
+	ExtractEngine          string
+	ExtractStoragePath     string
+	ExtractChars           int
+	ExtractPages           int
+	PreviewText            string
+	OCRUsed                bool
+	RAGReady               bool
+	RAGReason              string
+	EmbedStatus            string
+	EmbedSignature         string
+	EmbedError             string
+	PageCount              int
+	ChunkCount             int
+	ExtractorVersion       string
+	ExtractedAt            *time.Time
+	ProcessingPayloadJSON  string
+	ProcessingStartedAt    *time.Time
+	ProcessingCompletedAt  *time.Time
+	RagOptOut              bool
+	Favorite               bool
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
+}
+
+// FileShare 表示单个用户文件的公开分享。
+type FileShare struct {
+	ID        uint
+	ShareID   string
+	FileID    string
+	UserID    uint
+	Status    string
+	ExpiresAt *time.Time
+	RevokedAt *time.Time
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// FileObjectProcessing 表示 file_objects 中的服务端处理状态。
+type FileObjectProcessing struct {
+	ID                          uint
+	FileObjectID                uint
+	UserID                      uint
+	ExpectedStoragePath         string
+	ExpectedProcessingStartedAt *time.Time
+	DetectedMIME                string
+	FileCategory                string
+	ProcessingStatus            string
+	ProcessingReady             bool
+	ExtractStatus               string
+	ExtractEngine               string
+	ExtractStoragePath          string
+	ExtractChars                int
+	ExtractPages                int
+	PageCount                   int
+	PreviewText                 string
+	OCRUsed                     bool
+	RAGReady                    bool
+	RAGReason                   string
+	ErrorCode                   string
+	ErrorMessage                string
+	ExtractorVersion            string
+	PayloadJSON                 string
+	StartedAt                   *time.Time
+	CompletedAt                 *time.Time
+	ExtractedAt                 *time.Time
+	CreatedAt                   time.Time
+	UpdatedAt                   time.Time
+}
+
+// FileChunk 表示文件分片。
+// FileChunkModality 标识分片向量来自何种输入。
+const (
+	FileChunkModalityText  = "text"
+	FileChunkModalityImage = "image"
+)
+
+type FileChunk struct {
+	ID         uint
+	FileObjID  uint
+	UserID     uint
+	ChunkIndex int
+	PageNum    int
+	CharOffset int
+	// Modality 为 image 时向量由文件原图计算，Content 是可选的 OCR 文本，仅用于全文检索与展示。
+	Modality           string
+	Content            string
+	TokenCount         int
+	EmbeddingSignature string
+	CreatedAt          time.Time
+}
+
+// FileChunkSearchResult 表示分片检索结果。
+type FileChunkSearchResult struct {
+	FileChunk
+	Similarity float32
+	RankScore  float32
+}
+
+// StorageQuota 表示用户文件配额。
+type StorageQuota struct {
+	ID            uint
+	UserID        uint
+	QuotaBytes    int64
+	UsedBytes     int64
+	ReservedBytes int64
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+}
+
+// Run 表示对话运行日志。
+type Run struct {
+	ID                 uint
+	RunID              string
+	RequestID          string
+	UserID             uint
+	ConversationID     uint
+	TaskType           string
+	Endpoint           string
+	Provider           string
+	ProviderProtocol   string
+	UpstreamID         uint
+	UpstreamModelID    uint
+	UpstreamName       string
+	RequestedModelName string
+	PlatformModelName  string
+	RoutedBindingCode  string
+	ModelVendor        string
+	ModelIcon          string
+	UpstreamModelName  string
+	// UpstreamTaskID 是异步媒体任务在上游的任务编号（如 Sora 兼容视频的 video.id），
+	// 供失败后的任务重查定位上游结果；同步协议为空。
+	UpstreamTaskID           string
+	InputTokens              int64
+	OutputTokens             int64
+	CacheReadTokens          int64
+	CacheWriteTokens         int64
+	ReasoningTokens          int64
+	ToolCallsCount           int
+	FirstTokenLatencyMS      int64
+	TotalLatencyMS           int64
+	Status                   string
+	ErrorCode                string
+	ErrorMessage             string
+	ModerationState          string
+	ModerationEventID        string
+	ModerationCategoriesJSON string
+	StartedAt                time.Time
+	EndedAt                  *time.Time
+	CreatedAt                time.Time
+	UpdatedAt                time.Time
+}
+
+// RunStatus 表示用于状态同步的最小运行快照。
+type RunStatus struct {
+	RunID  string
+	Status string
+}
+
+// MessageTrace 表示消息处理轨迹。
+type MessageTrace struct {
+	ID              uint
+	MessageID       uint
+	ConversationID  uint
+	UserID          uint
+	RunID           string
+	TraceType       string
+	Status          string
+	Stage           string
+	RoundID         string
+	ParentEventID   string
+	Title           string
+	Summary         string
+	ContentMarkdown string
+	PayloadJSON     string
+	Seq             int
+	StartedAt       time.Time
+	EndedAt         *time.Time
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+}
+
+// MessageTraceEventRow 表示消息轨迹事件持久化行。
+type MessageTraceEventRow struct {
+	ID              uint
+	MessageID       uint
+	ConversationID  uint
+	UserID          uint
+	RunID           string
+	EventID         string
+	EventType       string
+	Phase           string
+	Stage           string
+	RoundID         string
+	ParentEventID   string
+	Status          string
+	Title           string
+	Summary         string
+	ContentMarkdown string
+	PayloadJSON     string
+	Seq             int
+	StartedAt       time.Time
+	EndedAt         *time.Time
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+}
+
+// EventLog 表示后台日志中心展示的对话运行事件。
+type EventLog struct {
+	ID                uint
+	MessageID         uint
+	ConversationID    uint
+	UserID            uint
+	RunID             string
+	ProviderProtocol  string
+	UpstreamName      string
+	PlatformModelName string
+	RoutedBindingCode string
+	UpstreamModelName string
+	EventScope        string
+	EventID           string
+	EventType         string
+	Phase             string
+	Stage             string
+	RoundID           string
+	ParentEventID     string
+	Status            string
+	Title             string
+	Summary           string
+	ContentMarkdown   string
+	PayloadJSON       string
+	PayloadSizeBytes  int64
+	PayloadOmitted    bool
+	Seq               int
+	ToolCallID        string
+	ToolName          string
+	LatencyMS         int64
+	InputJSON         string
+	InputSizeBytes    int64
+	InputOmitted      bool
+	OutputJSON        string
+	OutputSizeBytes   int64
+	OutputOmitted     bool
+	ErrorJSON         string
+	ErrorSizeBytes    int64
+	ErrorOmitted      bool
+	StartedAt         time.Time
+	EndedAt           *time.Time
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+}
+
+// ToolCallDetail 表示当前用户可读取的工具调用结果详情。
+type ToolCallDetail struct {
+	RunID           string
+	ToolCallID      string
+	ToolName        string
+	Status          string
+	OutputJSON      string
+	OutputSizeBytes int64
+	OutputOmitted   bool
+	ErrorJSON       string
+	ErrorSizeBytes  int64
+	ErrorOmitted    bool
+}
+
+// ToolCall 表示工具调用记录。
+type ToolCall struct {
+	ID             uint
+	MessageID      uint
+	ConversationID uint
+	UserID         uint
+	RunID          string
+	ToolCallID     string
+	ToolType       string
+	ToolName       string
+	Status         string
+	LatencyMS      int64
+	InputJSON      string
+	OutputJSON     string
+	ErrorJSON      string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
+// ContextSnapshot 表示上下文压缩快照。
+type ContextSnapshot struct {
+	ID                    uint
+	ConversationID        uint
+	MessageID             uint
+	UserID                uint
+	RunID                 string
+	FromTurn              int
+	ToTurn                int
+	CoveredUntilMessageID uint
+	CoveredUntilPublicID  string
+	CoveragePathHash      string
+	CoveredMessageCount   int
+	SourceTokens          int64
+	SummaryTokens         int64
+	SummaryText           string
+	Strategy              string
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
+}
+
+// RAGChunk 单个 RAG 检索到的文本片段及其来源信息。
+type RAGChunk struct {
+	Content    string
+	FileName   string
+	FileID     string
+	ChunkIndex int
+	Modality   string
+	Score      float32
+}
+
+// MessageChunk 表示消息向量分片，用于历史对话语义检索。
+type MessageChunk struct {
+	ID                 uint
+	ConversationID     uint
+	MessageID          uint
+	UserID             uint
+	Role               string
+	ChunkIndex         int
+	Content            string
+	TokenCount         int
+	EmbeddingSignature string
+	Similarity         float64 // 检索时附加的相似度分数（写入时为 0）
+	CreatedAt          time.Time
+}

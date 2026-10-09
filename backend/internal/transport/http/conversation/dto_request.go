@@ -1,0 +1,222 @@
+package conversation
+
+// CreateConversationRequest 创建会话请求。
+type CreateConversationRequest struct {
+	Title        string `json:"title,omitempty" binding:"max=255"`
+	Model        string `json:"model,omitempty" binding:"max=128"`
+	ProjectID    string `json:"projectID,omitempty" binding:"omitempty,max=32"`
+	RoleID       string `json:"roleID,omitempty" binding:"omitempty,max=32"`
+	AgentGroupID string `json:"agentGroupID,omitempty" binding:"omitempty,max=32"`
+}
+
+// WriteProjectFileRequest 手动创建或覆盖项目文件请求。
+type WriteProjectFileRequest struct {
+	Path    string `json:"path" binding:"required,max=1024"`
+	Content string `json:"content" binding:"max=20971520"`
+}
+
+// CreateConversationProjectRequest 创建会话项目请求。
+type CreateConversationProjectRequest struct {
+	Name                    string   `json:"name" binding:"required,max=80"`
+	Description             string   `json:"description,omitempty" binding:"max=255"`
+	SystemPrompt            string   `json:"systemPrompt,omitempty" binding:"max=12000"`
+	DefaultModel            string   `json:"defaultModel,omitempty" binding:"max=128"`
+	MCPDefaultMode          string   `json:"mcpDefaultMode,omitempty" binding:"omitempty,oneof=inherit custom"`
+	DefaultMCPToolIDs       []uint   `json:"defaultMCPToolIDs,omitempty"`
+	DefaultSkillIDs         []uint   `json:"defaultSkillIDs,omitempty" binding:"max=128"`
+	DefaultKnowledgeBaseIDs []string `json:"defaultKnowledgeBaseIDs,omitempty" binding:"max=8,dive,required,max=32"`
+	Color                   string   `json:"color,omitempty" binding:"max=32"`
+	Icon                    string   `json:"icon,omitempty" binding:"max=32"`
+}
+
+// UpdateConversationProjectRequest 更新会话项目请求。
+type UpdateConversationProjectRequest struct {
+	Name                    *string   `json:"name,omitempty" binding:"omitempty,max=80"`
+	Description             *string   `json:"description,omitempty" binding:"omitempty,max=255"`
+	SystemPrompt            *string   `json:"systemPrompt,omitempty" binding:"omitempty,max=12000"`
+	DefaultModel            *string   `json:"defaultModel,omitempty" binding:"omitempty,max=128"`
+	MCPDefaultMode          *string   `json:"mcpDefaultMode,omitempty" binding:"omitempty,oneof=inherit custom"`
+	DefaultMCPToolIDs       *[]uint   `json:"defaultMCPToolIDs,omitempty" binding:"omitempty"`
+	DefaultSkillIDs         *[]uint   `json:"defaultSkillIDs,omitempty" binding:"omitempty,max=128"`
+	DefaultKnowledgeBaseIDs *[]string `json:"defaultKnowledgeBaseIDs,omitempty" binding:"omitempty,max=8,dive,required,max=32"`
+	Color                   *string   `json:"color,omitempty" binding:"omitempty,max=32"`
+	Icon                    *string   `json:"icon,omitempty" binding:"omitempty,max=32"`
+	Status                  *string   `json:"status,omitempty" binding:"omitempty,oneof=active archived"`
+}
+
+// ReorderConversationProjectsRequest 更新项目排序请求。
+type ReorderConversationProjectsRequest struct {
+	ProjectIDs []string `json:"projectIDs" binding:"required,max=200"`
+}
+
+// CreateConversationRoleRequest 创建角色请求。
+type CreateConversationRoleRequest struct {
+	Name              string `json:"name" binding:"required,max=80"`
+	Description       string `json:"description,omitempty" binding:"max=255"`
+	SystemPrompt      string `json:"systemPrompt,omitempty" binding:"max=12000"`
+	Model             string `json:"model,omitempty" binding:"max=128"`
+	Provider          string `json:"provider,omitempty" binding:"max=32"`
+	ReasoningEffort   string `json:"reasoningEffort,omitempty" binding:"omitempty,oneof= low medium high xhigh max"`
+	MCPDefaultMode    string `json:"mcpDefaultMode,omitempty" binding:"omitempty,oneof=inherit custom"`
+	DefaultMCPToolIDs []uint `json:"defaultMCPToolIDs,omitempty"`
+	DefaultSkillIDs   []uint `json:"defaultSkillIDs,omitempty" binding:"max=128"`
+	Color             string `json:"color,omitempty" binding:"max=32"`
+	Icon              string `json:"icon,omitempty" binding:"max=32"`
+	GroupName         string `json:"groupName,omitempty" binding:"max=80"`
+	Pinned            bool   `json:"pinned,omitempty"`
+}
+
+// UpdateConversationRoleRequest 更新角色请求。
+type UpdateConversationRoleRequest struct {
+	Name              *string `json:"name,omitempty" binding:"omitempty,max=80"`
+	Description       *string `json:"description,omitempty" binding:"omitempty,max=255"`
+	SystemPrompt      *string `json:"systemPrompt,omitempty" binding:"omitempty,max=12000"`
+	Model             *string `json:"model,omitempty" binding:"omitempty,max=128"`
+	Provider          *string `json:"provider,omitempty" binding:"omitempty,max=32"`
+	ReasoningEffort   *string `json:"reasoningEffort,omitempty" binding:"omitempty,oneof= low medium high xhigh max"`
+	MCPDefaultMode    *string `json:"mcpDefaultMode,omitempty" binding:"omitempty,oneof=inherit custom"`
+	DefaultMCPToolIDs *[]uint `json:"defaultMCPToolIDs,omitempty" binding:"omitempty"`
+	DefaultSkillIDs   *[]uint `json:"defaultSkillIDs,omitempty" binding:"omitempty,max=128"`
+	Color             *string `json:"color,omitempty" binding:"omitempty,max=32"`
+	Icon              *string `json:"icon,omitempty" binding:"omitempty,max=32"`
+	Status            *string `json:"status,omitempty" binding:"omitempty,oneof=active archived"`
+	GroupName         *string `json:"groupName,omitempty" binding:"omitempty,max=80"`
+	Pinned            *bool   `json:"pinned,omitempty"`
+}
+
+// ReorderConversationRolesRequest 更新角色排序请求。
+type ReorderConversationRolesRequest struct {
+	RoleIDs []string `json:"roleIDs" binding:"required,max=200"`
+}
+
+// SetConversationProjectRequest 设置会话项目归属请求。
+type SetConversationProjectRequest struct {
+	ProjectID string `json:"projectID,omitempty" binding:"omitempty,max=32"`
+}
+
+// BatchSetConversationProjectRequest 批量设置会话项目归属请求。
+type BatchSetConversationProjectRequest struct {
+	ConversationPublicIDs []string `json:"conversationPublicIDs" binding:"required,max=1000"`
+	ProjectID             string   `json:"projectID,omitempty" binding:"omitempty,max=32"`
+}
+
+// RenameConversationRequest 重命名会话请求。
+type RenameConversationRequest struct {
+	Title string `json:"title" binding:"required,max=255"`
+}
+
+// DeleteMessageResponse 删除消息响应。
+type DeleteMessageResponse struct {
+	DeletedCount int64 `json:"deletedCount"`
+}
+
+// UpdateConversationLabelsRequest 更新会话标签请求。
+type UpdateConversationLabelsRequest struct {
+	Labels *[]string `json:"labels" binding:"required,max=6,dive,max=24" maxLength:"24"`
+}
+
+// SetConversationStarRequest 设置星标请求。
+type SetConversationStarRequest struct {
+	Starred *bool `json:"starred" binding:"required"`
+}
+
+// SetConversationArchiveRequest 设置归档状态请求。
+type SetConversationArchiveRequest struct {
+	Archived *bool `json:"archived" binding:"required"`
+}
+
+// CreateConversationShareRequest 创建会话公开分享请求。
+type CreateConversationShareRequest struct {
+	DefaultMessagePublicIDs []string `json:"defaultMessagePublicIDs,omitempty" binding:"max=1000"`
+}
+
+// RevokeConversationSharesRequest 批量关闭会话公开分享请求。
+type RevokeConversationSharesRequest struct {
+	ConversationPublicIDs []string `json:"conversationPublicIDs,omitempty" binding:"max=1000"`
+}
+
+// RenameFileRequest 文件重命名请求。
+type RenameFileRequest struct {
+	FileName string `json:"fileName" binding:"required,max=255"`
+}
+
+// UpdateFileRequest 文件更新请求，file_name 和 rag_opt_out 至少填一个。
+type UpdateFileRequest struct {
+	FileName  *string `json:"fileName,omitempty"`
+	RagOptOut *bool   `json:"ragOptOut,omitempty"`
+	Favorite  *bool   `json:"favorite,omitempty"`
+}
+
+// SendMessageRequest 发送消息请求。
+type SendMessageRequest struct {
+	ContentType             string                 `json:"contentType" binding:"required,oneof=text markdown image file mixed"`
+	Content                 string                 `json:"content" binding:"required"`
+	Model                   string                 `json:"model,omitempty" binding:"omitempty,max=128"`
+	ModelScope              string                 `json:"modelScope,omitempty" binding:"omitempty,oneof=platform user"`
+	UserModelID             uint                   `json:"userModelID,omitempty"`
+	Options                 map[string]interface{} `json:"options,omitempty"`
+	ClientRunID             string                 `json:"clientRunID,omitempty" binding:"omitempty,max=64"`
+	FileIDs                 []string               `json:"fileIDs,omitempty" binding:"max=20"`
+	SelectedToolIDs         []uint                 `json:"selectedToolIDs,omitempty"`
+	SkillIDs                []uint                 `json:"skillIDs,omitempty" binding:"max=128"`
+	KnowledgeBaseIDs        []string               `json:"knowledgeBaseIDs,omitempty" binding:"max=8,dive,required,max=32"`
+	HTMLVisualPromptEnabled bool                   `json:"htmlVisualPrompt,omitempty"`
+	// UIComponentIDs 是本次会话勾选的交互式组件；后端据此注入组件目录提示词，不可见的 ID 被忽略。
+	UIComponentIDs        []uint  `json:"uiComponentIDs,omitempty" binding:"max=32"`
+	ParentMessagePublicID string  `json:"parentMessagePublicID,omitempty" binding:"omitempty,max=32"`
+	SourceMessagePublicID string  `json:"sourceMessagePublicID,omitempty" binding:"omitempty,max=32"`
+	BranchReason          string  `json:"branchReason,omitempty" binding:"omitempty,oneof=default retry edit"`
+}
+
+// MediaImageRequest 图片生成/编辑请求。
+type MediaImageRequest struct {
+	Prompt                string                 `json:"prompt" binding:"required"`
+	Model                 string                 `json:"model,omitempty" binding:"omitempty,max=128"`
+	ModelScope            string                 `json:"modelScope,omitempty" binding:"omitempty,oneof=platform user"`
+	UserModelID           uint                   `json:"userModelID,omitempty"`
+	Options               map[string]interface{} `json:"options,omitempty"`
+	ClientRunID           string                 `json:"clientRunID,omitempty" binding:"omitempty,max=64"`
+	FileIDs               []string               `json:"fileIDs,omitempty" binding:"max=20"`
+	MaskFileID            string                 `json:"maskFileID,omitempty" binding:"omitempty,max=128"`
+	ParentMessagePublicID string                 `json:"parentMessagePublicID,omitempty" binding:"omitempty,max=32"`
+	SourceMessagePublicID string                 `json:"sourceMessagePublicID,omitempty" binding:"omitempty,max=32"`
+	BranchReason          string                 `json:"branchReason,omitempty" binding:"omitempty,oneof=default retry edit"`
+}
+
+// MediaVideoRequest 视频生成请求。
+type MediaVideoRequest struct {
+	Prompt                string         `json:"prompt" binding:"required"`
+	Model                 string         `json:"model,omitempty" binding:"omitempty,max=128"`
+	ModelScope            string         `json:"modelScope,omitempty" binding:"omitempty,oneof=platform user"`
+	UserModelID           uint           `json:"userModelID,omitempty"`
+	Options               map[string]any `json:"options,omitempty"`
+	ClientRunID           string         `json:"clientRunID,omitempty" binding:"omitempty,max=64"`
+	FileIDs               []string       `json:"fileIDs,omitempty" binding:"max=7"`
+	ParentMessagePublicID string         `json:"parentMessagePublicID,omitempty" binding:"omitempty,max=32"`
+	SourceMessagePublicID string         `json:"sourceMessagePublicID,omitempty" binding:"omitempty,max=32"`
+	BranchReason          string         `json:"branchReason,omitempty" binding:"omitempty,oneof=default retry edit"`
+}
+
+// MediaVideoExtensionRequest 视频扩展请求。
+type MediaVideoExtensionRequest struct {
+	ModelScope            string                 `json:"modelScope,omitempty" binding:"omitempty,oneof=platform user"`
+	UserModelID           uint                   `json:"userModelID,omitempty"`
+	Prompt                string                 `json:"prompt" binding:"required"`
+	Model                 string                 `json:"model,omitempty" binding:"omitempty,max=128"`
+	Options               map[string]interface{} `json:"options,omitempty"`
+	ClientRunID           string                 `json:"clientRunID,omitempty" binding:"omitempty,max=64"`
+	SourceVideoFileID     string                 `json:"sourceVideoFileID" binding:"required,max=128"`
+	ParentMessagePublicID string                 `json:"parentMessagePublicID,omitempty" binding:"omitempty,max=32"`
+	SourceMessagePublicID string                 `json:"sourceMessagePublicID,omitempty" binding:"omitempty,max=32"`
+	BranchReason          string                 `json:"branchReason,omitempty" binding:"omitempty,oneof=default retry edit"`
+}
+
+// SetMessageFeedbackRequest 设置消息反馈请求。
+type SetMessageFeedbackRequest struct {
+	Feedback string `json:"feedback,omitempty" binding:"omitempty,oneof=up down"`
+}
+
+// UpdateMessageRequest 更新消息内容请求。
+type UpdateMessageRequest struct {
+	Content string `json:"content" binding:"required"`
+}

@@ -1,0 +1,13 @@
+{
+  "name": "@deeix/api",
+  "version": "0.4.4-beta.2",
+  "private": true,
+  "scripts": {
+    "build": "make build",
+    "check": "make check-version && go vet ./...",
+    "clean": "rm -rf ../.cache/deeix-chat",
+    "dev": "make run",
+    "test": "make test",
+    "test:agent-group-contract": "go test ./internal/domain/conversation ./internal/transport/http/conversation -run \"AgentGroup.*Model\" -count=1"
+  }
+}

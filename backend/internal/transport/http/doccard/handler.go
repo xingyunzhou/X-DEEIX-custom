@@ -1,0 +1,116 @@
+package doccard
+
+import (
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+
+	appdoccard "github.com/DEEIX-AI/DEEIX-Chat/backend/internal/application/doccard"
+	"github.com/DEEIX-AI/DEEIX-Chat/backend/internal/shared/response"
+	"github.com/DEEIX-AI/DEEIX-Chat/backend/internal/transport/http/middleware"
+)
+
+// UpsertDocCardRequest 创建/更新卡片的请求体。
+type UpsertDocCardRequest struct {
+	Category  string   `json:"category" binding:"max=64"`
+	ProjectID *uint    `json:"projectId"`
+	RoleID    *uint    `json:"roleId"`
+	Title     string   `json:"title" binding:"required,max=128"`
+	Content   string   `json:"content" binding:"required,max=20000"`
+	Keywords  []string `json:"keywords" binding:"max=20"`
+	Enabled   *bool    `json:"enabled"`
+}
+
+// CardIDParam 路径参数。
+type CardIDParam struct {
+	ID string `uri:"id" binding:"required"`
+}
+
+// Handler 文档卡片域 HTTP 处理器。
+type Handler struct {
+	svc *appdoccard.Service
+}
+
+// NewHandler 创建处理器。
+func NewHandler(svc *appdoccard.Service) *Handler {
+	return &Handler{svc: svc}
+}
+
+// CreateDocCard 创建卡片。
+func (h *Handler) CreateDocCard(c *gin.Context) {
+	userID := middleware.MustUserID(c)
+	var req UpsertDocCardRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.InvalidRequestBody(c, err)
+		return
+	}
+	item, err := h.svc.UpsertDocCard(c, userID, "", appdoccard.UpsertInput{
+		Category:  req.Category,
+		ProjectID: req.ProjectID,
+		RoleID:    req.RoleID,
+		Title:     req.Title,
+		Content:   req.Content,
+		Keywords:  req.Keywords,
+		Enabled:   req.Enabled,
+	}, "user")
+	if err != nil {
+		response.InternalError(c)
+		return
+	}
+	response.Success(c, appdoccard.NewCardView(*item))
+}
+
+// UpdateDocCard 更新卡片。
+func (h *Handler) UpdateDocCard(c *gin.Context) {
+	userID := middleware.MustUserID(c)
+	var param CardIDParam
+	if err := c.ShouldBindUri(&param); err != nil {
+		response.ErrorWithCode(c, http.StatusBadRequest, response.CodeRequestInvalid)
+		return
+	}
+	var req UpsertDocCardRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.InvalidRequestBody(c, err)
+		return
+	}
+	item, err := h.svc.UpsertDocCard(c, userID, param.ID, appdoccard.UpsertInput{
+		Category:  req.Category,
+		ProjectID: req.ProjectID,
+		RoleID:    req.RoleID,
+		Title:     req.Title,
+		Content:   req.Content,
+		Keywords:  req.Keywords,
+		Enabled:   req.Enabled,
+	}, "user")
+	if err != nil {
+		response.ErrorWithCode(c, http.StatusNotFound, response.CodeResourceNotFound)
+		return
+	}
+	response.Success(c, appdoccard.NewCardView(*item))
+}
+
+// ListDocCards 列出全部卡片。
+func (h *Handler) ListDocCards(c *gin.Context) {
+	userID := middleware.MustUserID(c)
+	items, err := h.svc.ListDocCards(c, userID)
+	if err != nil {
+		response.InternalError(c)
+		return
+	}
+	response.Success(c, items)
+}
+
+// DeleteDocCard 删除卡片。
+func (h *Handler) DeleteDocCard(c *gin.Context) {
+	userID := middleware.MustUserID(c)
+	var param CardIDParam
+	if err := c.ShouldBindUri(&param); err != nil {
+		response.ErrorWithCode(c, http.StatusBadRequest, response.CodeRequestInvalid)
+		return
+	}
+	if err := h.svc.DeleteDocCard(c, userID, param.ID); err != nil {
+		response.ErrorWithCode(c, http.StatusNotFound, response.CodeResourceNotFound)
+		return
+	}
+	response.Success(c, gin.H{"deleted": true})
+}

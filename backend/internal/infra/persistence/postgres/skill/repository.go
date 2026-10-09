@@ -1,0 +1,400 @@
+package skill
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"time"
+
+	domainskill "github.com/DEEIX-AI/DEEIX-Chat/backend/internal/domain/skill"
+	"github.com/DEEIX-AI/DEEIX-Chat/backend/internal/infra/persistence/dberror"
+	model "github.com/DEEIX-AI/DEEIX-Chat/backend/internal/infra/persistence/models"
+	"github.com/DEEIX-AI/DEEIX-Chat/backend/internal/repository"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+// Repo 封装技能数据访问。
+type Repo struct {
+	db *gorm.DB
+}
+
+// NewRepo 创建技能仓储。
+func NewRepo(db *gorm.DB) *Repo {
+	return &Repo{db: db}
+}
+
+// ListSkills 分页查询技能。
+func (r *Repo) ListSkills(ctx context.Context, filter repository.SkillListFilter, offset int, limit int) ([]domainskill.Skill, int64, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+
+	items := make([]model.Skill, 0, limit)
+	var total int64
+	query := r.db.WithContext(ctx).Model(&model.Skill{})
+	query = applySkillFilter(query, filter)
+
+	if err := query.Count(&total).Error; err != nil {
+		return nil, 0, translateError(err)
+	}
+	if err := query.
+		Order(skillOrderClause(filter)).
+		Offset(offset).
+		Limit(limit).
+		Find(&items).Error; err != nil {
+		return nil, 0, translateError(err)
+	}
+
+	results := make([]domainskill.Skill, 0, len(items))
+	for _, item := range items {
+		results = append(results, toDomain(item))
+	}
+	return results, total, nil
+}
+
+// GetSkill 按主键查询技能。
+func (r *Repo) GetSkill(ctx context.Context, id uint) (*domainskill.Skill, error) {
+	if id == 0 {
+		return nil, repository.ErrInvalidInput
+	}
+	var record model.Skill
+	if err := r.db.WithContext(ctx).Where("id = ?", id).First(&record).Error; err != nil {
+		return nil, translateError(err)
+	}
+	result := toDomain(record)
+	return &result, nil
+}
+
+// CreateSkill 创建技能。
+func (r *Repo) CreateSkill(ctx context.Context, item *domainskill.Skill) (*domainskill.Skill, error) {
+	if item == nil {
+		return nil, repository.ErrInvalidInput
+	}
+	record := model.Skill{
+		Scope:            strings.TrimSpace(item.Scope),
+		OwnerUserID:      item.OwnerUserID,
+		Title:            strings.TrimSpace(item.Title),
+		Trigger:          strings.TrimSpace(item.Trigger),
+		Description:      strings.TrimSpace(item.Description),
+		Markdown:         strings.TrimSpace(item.Markdown),
+		PackageType:      strings.TrimSpace(item.PackageType),
+		PackageRootDir:   strings.TrimSpace(item.PackageRootDir),
+		PackageFilesJSON: encodePackageFiles(item.PackageFiles),
+		Enabled:          item.Enabled,
+		SortOrder:        item.SortOrder,
+		CreatedByUserID:  item.CreatedByUserID,
+		UpdatedByUserID:  item.UpdatedByUserID,
+	}
+	var result domainskill.Skill
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := r.lockUserSkillOwner(tx, record.Scope, record.OwnerUserID); err != nil {
+			return err
+		}
+		if record.SortOrder <= 0 {
+			var maxSortOrder int
+			if err := tx.Model(&model.Skill{}).
+				Where("scope = ? AND owner_user_id = ?", record.Scope, record.OwnerUserID).
+				Select("COALESCE(MAX(sort_order), 0)").
+				Scan(&maxSortOrder).Error; err != nil {
+				return translateError(err)
+			}
+			record.SortOrder = maxSortOrder + 1
+		}
+		if err := tx.Create(&record).Error; err != nil {
+			return translateError(err)
+		}
+		result = toDomain(record)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// PatchSkill 更新技能字段。
+func (r *Repo) PatchSkill(ctx context.Context, id uint, patch repository.SkillPatch) (*domainskill.Skill, error) {
+	if id == 0 {
+		return nil, repository.ErrInvalidInput
+	}
+	var result domainskill.Skill
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var owner model.Skill
+		if err := tx.Select("id", "scope", "owner_user_id").Where("id = ?", id).First(&owner).Error; err != nil {
+			return translateError(err)
+		}
+		if err := r.lockUserSkillOwner(tx, owner.Scope, owner.OwnerUserID); err != nil {
+			return err
+		}
+
+		var record model.Skill
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ?", id).
+			First(&record).Error; err != nil {
+			return translateError(err)
+		}
+		if record.Scope != owner.Scope || record.OwnerUserID != owner.OwnerUserID {
+			return repository.ErrConflict
+		}
+		if patch.ExpectedUpdatedAt != nil && !sameSkillVersion(record.UpdatedAt, *patch.ExpectedUpdatedAt) {
+			return repository.ErrConflict
+		}
+
+		updates := map[string]interface{}{}
+		if patch.Title != nil {
+			updates["title"] = strings.TrimSpace(*patch.Title)
+		}
+		if patch.Trigger != nil {
+			updates["trigger"] = strings.TrimSpace(*patch.Trigger)
+		}
+		if patch.Description != nil {
+			updates["description"] = strings.TrimSpace(*patch.Description)
+		}
+		if patch.Markdown != nil {
+			updates["markdown"] = strings.TrimSpace(*patch.Markdown)
+		}
+		if patch.PackageType != nil {
+			updates["package_type"] = strings.TrimSpace(*patch.PackageType)
+		}
+		if patch.PackageRootDir != nil {
+			updates["package_root_dir"] = strings.TrimSpace(*patch.PackageRootDir)
+		}
+		if patch.PackageFilesJSON != nil {
+			updates["package_files_json"] = strings.TrimSpace(*patch.PackageFilesJSON)
+		}
+		if patch.Enabled != nil {
+			updates["enabled"] = *patch.Enabled
+		}
+		if patch.SortOrder != nil {
+			updates["sort_order"] = *patch.SortOrder
+		}
+		if patch.UpdatedByUserIDSet {
+			updates["updated_by_user_id"] = patch.UpdatedByUserID
+		}
+		if len(updates) > 0 {
+			updates["updated_at"] = nextSkillVersion(record.UpdatedAt)
+			updateResult := tx.Model(&model.Skill{}).
+				Where("id = ? AND updated_at = ?", record.ID, record.UpdatedAt).
+				Updates(updates)
+			if updateResult.Error != nil {
+				return translateError(updateResult.Error)
+			}
+			if updateResult.RowsAffected == 0 {
+				return repository.ErrConflict
+			}
+		}
+		if err := tx.Where("id = ?", id).First(&record).Error; err != nil {
+			return translateError(err)
+		}
+		result = toDomain(record)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// DeleteSkill 删除技能。
+func (r *Repo) DeleteSkill(ctx context.Context, id uint, expectedUpdatedAt *time.Time) error {
+	if id == 0 {
+		return repository.ErrInvalidInput
+	}
+	if err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var owner model.Skill
+		if err := tx.Select("id", "scope", "owner_user_id").Where("id = ?", id).First(&owner).Error; err != nil {
+			return translateError(err)
+		}
+		if err := r.lockUserSkillOwner(tx, owner.Scope, owner.OwnerUserID); err != nil {
+			return err
+		}
+
+		var locked model.Skill
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", id).First(&locked).Error; err != nil {
+			return translateError(err)
+		}
+		if locked.Scope != owner.Scope || locked.OwnerUserID != owner.OwnerUserID {
+			return repository.ErrConflict
+		}
+		if expectedUpdatedAt != nil && !sameSkillVersion(locked.UpdatedAt, *expectedUpdatedAt) {
+			return repository.ErrConflict
+		}
+		result := tx.Where("id = ? AND updated_at = ?", id, locked.UpdatedAt).Delete(&model.Skill{})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return repository.ErrConflict
+		}
+		return tx.Where("skill_id = ?", id).Delete(&model.ConversationProjectSkill{}).Error
+	}); err != nil {
+		return translateError(err)
+	}
+	return nil
+}
+
+func (r *Repo) lockUserSkillOwner(tx *gorm.DB, scope string, ownerUserID uint) error {
+	if strings.TrimSpace(scope) != domainskill.ScopeUser {
+		return nil
+	}
+	if ownerUserID == 0 {
+		return repository.ErrInvalidInput
+	}
+	query := tx.Model(&model.User{}).Select("id").Where("id = ?", ownerUserID)
+	if tx.Dialector != nil && tx.Dialector.Name() != "sqlite" {
+		query = query.Clauses(clause.Locking{Strength: "SHARE"})
+	}
+	var owner model.User
+	if err := query.First(&owner).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return repository.ErrNotFound
+		}
+		return translateError(err)
+	}
+	return nil
+}
+
+func applySkillFilter(query *gorm.DB, filter repository.SkillListFilter) *gorm.DB {
+	if len(filter.IDs) > 0 {
+		query = query.Where("id IN ?", filter.IDs)
+	}
+	if filter.VisibleUserID != nil {
+		userID := *filter.VisibleUserID
+		query = query.Where(
+			"(scope = ? AND enabled = ?) OR (scope = ? AND owner_user_id = ? AND enabled = ?)",
+			domainskill.ScopeBuiltin,
+			true,
+			domainskill.ScopeUser,
+			userID,
+			true,
+		)
+	} else {
+		if scope := strings.TrimSpace(filter.Scope); scope != "" {
+			query = query.Where("scope = ?", scope)
+		}
+		if filter.OwnerUserID != nil {
+			query = query.Where("owner_user_id = ?", *filter.OwnerUserID)
+		}
+		if filter.Enabled != nil {
+			query = query.Where("enabled = ?", *filter.Enabled)
+		}
+	}
+	if keyword := strings.TrimSpace(filter.Query); keyword != "" {
+		like := "%" + strings.ToLower(keyword) + "%"
+		if filter.SearchMarkdown {
+			query = query.Where(
+				"LOWER(title) LIKE ? OR LOWER(trigger) LIKE ? OR LOWER(description) LIKE ? OR LOWER(markdown) LIKE ?",
+				like,
+				like,
+				like,
+				like,
+			)
+		} else {
+			query = query.Where(
+				"LOWER(title) LIKE ? OR LOWER(trigger) LIKE ? OR LOWER(description) LIKE ?",
+				like,
+				like,
+				like,
+			)
+		}
+	}
+	return query
+}
+
+func skillOrderClause(filter repository.SkillListFilter) string {
+	if filter.VisibleUserID != nil {
+		return "CASE WHEN scope = 'user' THEN 0 ELSE 1 END ASC, sort_order ASC, updated_at DESC, id DESC"
+	}
+	return "CASE WHEN enabled THEN 0 ELSE 1 END ASC, sort_order ASC, updated_at DESC, id DESC"
+}
+
+func toDomain(item model.Skill) domainskill.Skill {
+	return domainskill.Skill{
+		ID:              item.ID,
+		Scope:           item.Scope,
+		OwnerUserID:     item.OwnerUserID,
+		Title:           item.Title,
+		Trigger:         item.Trigger,
+		Description:     item.Description,
+		Markdown:        item.Markdown,
+		PackageType:     item.PackageType,
+		PackageRootDir:  item.PackageRootDir,
+		PackageFiles:    decodePackageFiles(item.PackageFilesJSON),
+		Enabled:         item.Enabled,
+		SortOrder:       item.SortOrder,
+		CreatedByUserID: item.CreatedByUserID,
+		UpdatedByUserID: item.UpdatedByUserID,
+		CreatedAt:       item.CreatedAt,
+		UpdatedAt:       item.UpdatedAt,
+	}
+}
+
+func translateError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if dberror.IsRecordNotFound(err) {
+		return repository.ErrNotFound
+	}
+	if dberror.IsUniqueConstraint(err) {
+		return repository.ErrDuplicate
+	}
+	return err
+}
+
+func sameSkillVersion(current time.Time, expected time.Time) bool {
+	return current.UTC().Truncate(time.Microsecond).Equal(expected.UTC().Truncate(time.Microsecond))
+}
+
+func nextSkillVersion(current time.Time) time.Time {
+	next := time.Now().UTC().Truncate(time.Microsecond)
+	current = current.UTC().Truncate(time.Microsecond)
+	if !next.After(current) {
+		next = current.Add(time.Microsecond)
+	}
+	return next
+}
+
+// packageFileRecord 是包文件清单的持久化形态（领域类型不含 JSON 契约，存储层负责映射）。
+type packageFileRecord struct {
+	Path      string `json:"path"`
+	Size      int64  `json:"size"`
+	Kind      string `json:"kind"`
+	ObjectKey string `json:"object_key,omitempty"`
+}
+
+func encodePackageFiles(files []domainskill.PackageFile) string {
+	if len(files) == 0 {
+		return ""
+	}
+	records := make([]packageFileRecord, 0, len(files))
+	for _, file := range files {
+		records = append(records, packageFileRecord{Path: file.Path, Size: file.Size, Kind: file.Kind, ObjectKey: file.ObjectKey})
+	}
+	data, err := json.Marshal(records)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func decodePackageFiles(raw string) []domainskill.PackageFile {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var records []packageFileRecord
+	if err := json.Unmarshal([]byte(raw), &records); err != nil {
+		return nil
+	}
+	files := make([]domainskill.PackageFile, 0, len(records))
+	for _, record := range records {
+		files = append(files, domainskill.PackageFile{Path: record.Path, Size: record.Size, Kind: record.Kind, ObjectKey: record.ObjectKey})
+	}
+	return files
+}

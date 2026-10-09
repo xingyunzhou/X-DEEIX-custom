@@ -1,0 +1,1304 @@
+package llm
+
+import (
+	"context"
+	"encoding/base64"
+	"fmt"
+	"strings"
+)
+
+// openAIResponsesAdapter 实现 OpenAI Responses API（POST /v1/responses）。
+type openAIResponsesAdapter struct {
+	client *Client
+}
+
+func (a *openAIResponsesAdapter) Name() string { return AdapterOpenAIResponses }
+
+func (a *openAIResponsesAdapter) Generate(ctx context.Context, route RouteConfig, input GenerateInput) (*GenerateOutput, error) {
+	if err := validateResponsesMediaParts(input.Messages); err != nil {
+		return nil, err
+	}
+	route.Endpoint = EndpointResponses
+	return a.client.generateOpenAICompatible(ctx, route, input)
+}
+
+func (a *openAIResponsesAdapter) GenerateStream(ctx context.Context, route RouteConfig, input GenerateInput, onEvent func(GenerateStreamEvent) error) (*GenerateOutput, error) {
+	if err := validateResponsesMediaParts(input.Messages); err != nil {
+		return nil, err
+	}
+	route.Endpoint = EndpointResponses
+	return a.client.generateStreamOpenAICompatible(ctx, route, input, onEvent)
+}
+
+func (a *openAIResponsesAdapter) ListModels(ctx context.Context, route RouteConfig) ([]ModelItem, error) {
+	return a.client.listModelsOpenAICompatible(ctx, route)
+}
+
+func buildResponsesRequestBody(
+	adapter string,
+	model string,
+	input GenerateInput,
+	messages []Message,
+	providerTools []map[string]interface{},
+	toolDefinitions []ToolDefinition,
+	toolsEnabled bool,
+	providerStreamOptions map[string]interface{},
+	stream bool,
+) map[string]interface{} {
+	if adapter == AdapterOpenRouterResponses {
+		payload := buildOpenRouterResponsesRequestBody(model, input, messages, providerTools, toolDefinitions, providerStreamOptions, stream)
+		enforceEphemeralResponsesPayload(payload, input)
+		return payload
+	}
+	promptCache := resolveOpenAIPromptCacheConfig(adapter, input)
+	items := buildResponsesAPIInput(messages, &promptCache)
+	payload := map[string]interface{}{
+		"model":  strings.TrimSpace(model),
+		"input":  items,
+		"stream": stream,
+	}
+	if adapter == AdapterOpenAIResponses && input.ResponsesBackground && !input.Ephemeral {
+		payload["background"] = true
+		payload["store"] = true
+	}
+	if instructions := strings.TrimSpace(input.Instructions); adapter == AdapterOpenAIResponses && instructions != "" {
+		payload["instructions"] = instructions
+	}
+	if maxTokens := modelParamInt(input.Options, "max_output_tokens"); maxTokens > 0 {
+		payload["max_output_tokens"] = maxTokens
+	}
+	applyOpenAICompatibleSamplingParams(payload, input.Options, false)
+	applyOpenAIResponsesReasoningParams(payload, input.Options)
+	applyOpenAIResponsesTextParams(payload, input.Options, adapter == AdapterOpenAIResponses)
+	webSearchTools := []map[string]interface{}{}
+	if toolsEnabled && modelParamBool(input.Options, "web_search") && adapter == AdapterOpenAIResponses {
+		webSearchTools = append(webSearchTools, map[string]interface{}{"type": "web_search"})
+	}
+	nativeTools := append([]map[string]interface{}{}, providerTools...)
+	nativeTools = append(nativeTools, webSearchTools...)
+	applyOpenAIPromptCacheRequestFields(payload, promptCache)
+	appendToolDeclarations(payload, providerTools, webSearchTools, buildOpenAITools(toolDefinitions, false))
+	// 有状态会话：提供 previous_response_id 时服务端续接存储的历史，
+	// input 仅包含本轮新消息，避免全量重传。
+	if prevID := strings.TrimSpace(input.PreviousResponseID); prevID != "" && !input.Ephemeral {
+		payload["previous_response_id"] = prevID
+	}
+	if streamOptions := responsesStreamOptions(providerStreamOptions); stream && len(streamOptions) > 0 {
+		payload["stream_options"] = streamOptions
+	}
+	applyProviderOptions(payload, input.Options, responsesProtectedProviderOptionKeys(adapter, strings.TrimSpace(input.Instructions) != "")...)
+	if supportsResponsesIncludeDefaults(adapter) {
+		defaultIncludes := responsesDefaultIncludeValues(adapter, stream, nativeTools)
+		appendResponseInclude(payload, responseIncludeValues(input.Options, defaultIncludes...)...)
+	} else {
+		appendResponseInclude(payload, responseIncludeValues(input.Options)...)
+	}
+	enforceEphemeralResponsesPayload(payload, input)
+	return payload
+}
+
+// Enforce after provider options so user overrides cannot enable response storage.
+func enforceEphemeralResponsesPayload(payload map[string]interface{}, input GenerateInput) {
+	if !input.Ephemeral {
+		return
+	}
+	payload["store"] = false
+	for _, key := range []string{"background", "previous_response_id", "prompt_cache_key", "prompt_cache_options", "prompt_cache_retention"} {
+		delete(payload, key)
+	}
+}
+
+func responsesProtectedProviderOptionKeys(adapter string, hasManagedInstructions bool) []string {
+	keys := []string{
+		"contents",
+		"include",
+		"input",
+		"messages",
+		"model",
+		"prompt_cache_key",
+		"prompt_cache_options",
+		"prompt_cache_retention",
+		"previous_response_id",
+		"reasoning",
+		"response_format",
+		"stream",
+		"stream_options",
+		"system",
+		"systemInstruction",
+		"text",
+		"tools",
+	}
+	if adapter == AdapterOpenAIResponses {
+		keys = append(keys, "background", "store")
+	}
+	if adapter != AdapterOpenAIResponses {
+		keys = append(keys, "instructions", "metadata", "prompt")
+	} else if hasManagedInstructions {
+		keys = append(keys, "instructions")
+	}
+	return keys
+}
+
+func responsesStreamOptions(options map[string]interface{}) map[string]interface{} {
+	if len(options) == 0 {
+		return nil
+	}
+	result := map[string]interface{}{}
+	if value, ok := options["include_obfuscation"]; ok {
+		result["include_obfuscation"] = value
+	}
+	return result
+}
+
+func applyOpenAIResponsesReasoningParams(payload map[string]interface{}, options map[string]interface{}) {
+	reasoning := map[string]interface{}{}
+	if existing := modelParamMap(options, "reasoning"); len(existing) > 0 {
+		for key, value := range existing {
+			reasoning[key] = value
+		}
+	}
+	if effort := modelParamString(options, "reasoning_effort"); effort != "" {
+		reasoning["effort"] = effort
+	}
+	if summary := modelParamString(options, "reasoning_summary"); summary != "" {
+		reasoning["summary"] = summary
+	}
+	mergeObjectParam(payload, "reasoning", reasoning)
+}
+
+func applyOpenAIResponsesTextParams(payload map[string]interface{}, options map[string]interface{}, allowVerbosity bool) {
+	text := map[string]interface{}{}
+	if existing := modelParamMap(options, "text"); len(existing) > 0 {
+		for key, value := range existing {
+			text[key] = value
+		}
+	}
+	if format, ok := normalizedJSONResponseFormat(options); ok {
+		text["format"] = format
+	}
+	if verbosity := modelParamString(options, "verbosity"); verbosity != "" && allowVerbosity {
+		text["verbosity"] = verbosity
+	}
+	mergeObjectParam(payload, "text", text)
+}
+
+type responsesProtocolExtension struct {
+	matchesAdapter                  func(adapter string) bool
+	includeDefaults                 func(stream bool, tools []map[string]interface{}) []string
+	serverToolIdentifierKeys        func() []string
+	serverToolCallID                func(item map[string]interface{}, itemType string) (string, bool)
+	isServerToolCallItem            func(item map[string]interface{}) bool
+	isServerToolCallType            func(itemType string) bool
+	normalizeServerSideToolUsageKey func(value string, original string) (string, bool)
+}
+
+func supportsResponsesIncludeDefaults(adapter string) bool {
+	return adapter == AdapterOpenAIResponses || len(responsesProtocolExtensionsForAdapter(adapter)) > 0
+}
+
+func responsesDefaultIncludeValues(adapter string, stream bool, providerTools []map[string]interface{}) []string {
+	values := []string{"reasoning.encrypted_content"}
+	if adapter == AdapterOpenAIResponses {
+		values = append(values, openAIResponsesDefaultIncludeValues(providerTools)...)
+	}
+	for _, extension := range responsesProtocolExtensionsForAdapter(adapter) {
+		if extension.includeDefaults != nil {
+			values = append(values, extension.includeDefaults(stream, providerTools)...)
+		}
+	}
+	return appendUniqueStrings(nil, values...)
+}
+
+func openAIResponsesDefaultIncludeValues(tools []map[string]interface{}) []string {
+	if !responsesToolsIncludeType(tools, "web_search") {
+		return nil
+	}
+	return []string{"web_search_call.action.sources"}
+}
+
+func responsesToolsIncludeType(tools []map[string]interface{}, toolType string) bool {
+	expected := strings.TrimSpace(toolType)
+	if expected == "" {
+		return false
+	}
+	for _, tool := range tools {
+		if strings.TrimSpace(getString(tool["type"])) == expected {
+			return true
+		}
+	}
+	return false
+}
+
+func buildResponsesAPIInput(messages []Message, promptCache *openAIPromptCacheConfig) []map[string]interface{} {
+	items := make([]map[string]interface{}, 0, len(messages))
+	for _, msg := range messages {
+		if len(msg.ToolCalls) > 0 {
+			for _, item := range msg.ToolCalls {
+				args := strings.TrimSpace(item.ArgumentsJSON)
+				if args == "" {
+					args = "{}"
+				}
+				items = append(items, map[string]interface{}{
+					"type":      "function_call",
+					"call_id":   strings.TrimSpace(item.ToolCallID),
+					"name":      strings.TrimSpace(item.ToolName),
+					"arguments": args,
+				})
+			}
+			continue
+		}
+		if len(msg.ToolResults) > 0 {
+			for _, item := range msg.ToolResults {
+				items = append(items, map[string]interface{}{
+					"type":    "function_call_output",
+					"call_id": strings.TrimSpace(item.ToolCallID),
+					"output":  buildToolResultContent(item),
+				})
+			}
+			continue
+		}
+		items = append(items, map[string]interface{}{
+			"role":    normalizeRole(msg.Role),
+			"content": buildResponsesAPIContent(msg, promptCache),
+		})
+	}
+	return items
+}
+
+func validateResponsesMediaParts(messages []Message) error {
+	for _, message := range messages {
+		for _, part := range message.Parts {
+			switch part.Kind {
+			case ContentPartAudio, ContentPartVideo:
+				return fmt.Errorf("responses_api_unsupported_media: %s input is not supported", part.Kind)
+			}
+		}
+	}
+	return nil
+}
+
+// buildResponsesAPIContent 将消息内容序列化为 Responses API 格式（content 数组）。
+func buildResponsesAPIContent(msg Message, promptCache *openAIPromptCacheConfig) []map[string]interface{} {
+	textType := responsesTextContentType(msg.Role)
+	if len(msg.Parts) == 0 {
+		block := map[string]interface{}{"type": textType, "text": msg.Content}
+		appendOpenAIPromptCacheBreakpoint(block, msg.CacheControl, promptCache)
+		return []map[string]interface{}{block}
+	}
+	parts := make([]map[string]interface{}, 0, len(msg.Parts))
+	for _, part := range msg.Parts {
+		switch part.Kind {
+		case ContentPartImage:
+			if normalizeRole(msg.Role) == "assistant" {
+				continue
+			}
+			if len(part.Data) == 0 {
+				continue
+			}
+			mime := strings.TrimSpace(part.MimeType)
+			if mime == "" {
+				mime = "image/jpeg"
+			}
+			b64 := base64.StdEncoding.EncodeToString(part.Data)
+			block := map[string]interface{}{
+				"type":      "input_image",
+				"image_url": "data:" + mime + ";base64," + b64,
+			}
+			appendOpenAIPromptCacheBreakpoint(block, part.CacheControl, promptCache)
+			parts = append(parts, block)
+		default: // text, file
+			text := part.Text
+			if strings.TrimSpace(text) == "" {
+				continue
+			}
+			block := map[string]interface{}{
+				"type": textType,
+				"text": text,
+			}
+			appendOpenAIPromptCacheBreakpoint(block, part.CacheControl, promptCache)
+			parts = append(parts, block)
+		}
+	}
+	if len(parts) == 0 {
+		block := map[string]interface{}{"type": textType, "text": msg.Content}
+		appendOpenAIPromptCacheBreakpoint(block, msg.CacheControl, promptCache)
+		return []map[string]interface{}{block}
+	}
+	if msg.CacheControl != nil {
+		for index := len(parts) - 1; index >= 0; index-- {
+			if appendOpenAIPromptCacheBreakpoint(parts[index], msg.CacheControl, promptCache) {
+				break
+			}
+		}
+	}
+	return parts
+}
+
+func responsesTextContentType(role string) string {
+	if normalizeRole(role) == "assistant" {
+		return "output_text"
+	}
+	return "input_text"
+}
+
+func applyResponsesStreamEvent(
+	adapter string,
+	eventName string,
+	parsed map[string]interface{},
+	rawBody string,
+	result *GenerateOutput,
+	onEvent func(GenerateStreamEvent) error,
+) error {
+	return applyResponsesStreamEventWithToolPolicy(adapter, eventName, parsed, rawBody, result, onEvent, true)
+}
+
+func applyResponsesStreamEventWithToolPolicy(
+	adapter string,
+	eventName string,
+	parsed map[string]interface{},
+	rawBody string,
+	result *GenerateOutput,
+	onEvent func(GenerateStreamEvent) error,
+	allowNativeTools bool,
+) error {
+	eventType := strings.TrimSpace(getString(parsed["type"]))
+	if eventType == "" {
+		eventType = strings.TrimSpace(eventName)
+	}
+
+	if call, ok := parseResponsesServerToolStatusEvent(eventType, parsed); ok {
+		if !allowNativeTools {
+			return nil
+		}
+		appendUniqueToolCall(&result.ServerToolCalls, call)
+		if onEvent != nil {
+			return onEvent(GenerateStreamEvent{
+				ServerToolCall: &call,
+				ResponseID:     result.ResponseID,
+			})
+		}
+		return nil
+	}
+
+	switch eventType {
+	case "response.created":
+		var eventErr error
+		if responseID := strings.TrimSpace(getStringFromPath(parsed, "response", "id")); responseID != "" {
+			result.ResponseID = responseID
+			if onEvent != nil {
+				eventErr = onEvent(GenerateStreamEvent{ResponseID: responseID})
+			}
+		}
+		if serviceTier := strings.TrimSpace(getStringFromPath(parsed, "response", "service_tier")); serviceTier != "" {
+			result.Usage.ServiceTier = serviceTier
+		}
+		return eventErr
+	case "response.output_item.added", "response.output_item.in_progress":
+		return mergeResponsesStreamOutputItemWithToolPolicy(result, eventType, asMap(parsed["item"]), onEvent, allowNativeTools)
+	case "response.output_item.done":
+		return mergeResponsesStreamOutputItemWithToolPolicy(result, eventType, asMap(parsed["item"]), onEvent, allowNativeTools)
+	case "response.custom_tool_call_input.delta", "response.custom_tool_call_input.done":
+		if !allowNativeTools {
+			return nil
+		}
+		return mergeResponsesCustomToolInputEvent(result, parsed, onEvent)
+	case "response.output_text.delta":
+		delta := getString(parsed["delta"])
+		if delta == "" {
+			return nil
+		}
+		result.Text += delta
+		if onEvent != nil {
+			return onEvent(GenerateStreamEvent{
+				Delta:      delta,
+				ResponseID: result.ResponseID,
+			})
+		}
+	case "response.output_text.done":
+		text := firstNonEmptyString(getString(parsed["text"]), getString(parsed["delta"]))
+		if text != "" && !strings.Contains(result.Text, text) {
+			result.Text += text
+		}
+	case "response.refusal.delta":
+		delta := getString(parsed["delta"])
+		if delta == "" {
+			return nil
+		}
+		result.Text += delta
+		if onEvent != nil {
+			return onEvent(GenerateStreamEvent{
+				Delta:      delta,
+				ResponseID: result.ResponseID,
+			})
+		}
+	case "response.refusal.done":
+		text := firstNonEmptyString(getString(parsed["refusal"]), getString(parsed["text"]), getString(parsed["delta"]))
+		if text != "" && !strings.Contains(result.Text, text) {
+			result.Text += text
+		}
+	case "response.image_generation_call.partial_image":
+		image, ok := parseResponsesPartialImage(parsed)
+		if !ok || onEvent == nil {
+			return nil
+		}
+		return onEvent(GenerateStreamEvent{
+			GeneratedImage:        &image,
+			GeneratedImageIndex:   toInt64(parsed["partial_image_index"]),
+			GeneratedImagePartial: true,
+			ResponseID:            result.ResponseID,
+		})
+	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.thinking.delta":
+		reasoning := parseResponsesReasoningDelta(eventType, parsed)
+		if reasoning == nil || reasoning.Text == "" {
+			return nil
+		}
+		mergeReasoningDeltaOutput(&result.Reasoning, reasoning)
+		if onEvent != nil {
+			return onEvent(GenerateStreamEvent{
+				Reasoning:  reasoning,
+				ResponseID: result.ResponseID,
+			})
+		}
+	case "response.reasoning_summary_text.done", "response.reasoning_text.done", "response.thinking.done":
+		reasoning := parseResponsesReasoningDone(eventType, parsed)
+		if reasoning == nil || reasoning.Text == "" {
+			return nil
+		}
+		if result.Reasoning == nil || !reasoningOutputContains(result.Reasoning, reasoning.Text) {
+			mergeReasoningDeltaOutput(&result.Reasoning, reasoning)
+		}
+	case "response.completed":
+		output := buildGenerateOutputFromParsedForAdapterWithToolPolicy(
+			EndpointResponses,
+			adapter,
+			asMap(parsed["response"]),
+			textEncodedToolCallsInactive,
+			allowNativeTools,
+		)
+		if result.Reasoning == nil && output.Reasoning != nil && onEvent != nil {
+			if text := firstNonEmptyString(output.Reasoning.Text, output.Reasoning.Summary); text != "" {
+				if err := onEvent(GenerateStreamEvent{
+					Reasoning: &ReasoningDelta{
+						EventType:        eventType,
+						ItemID:           output.Reasoning.ItemID,
+						Status:           output.Reasoning.Status,
+						Kind:             "content_text",
+						Text:             text,
+						EncryptedContent: output.Reasoning.EncryptedContent,
+					},
+					ResponseID: firstNonEmptyString(result.ResponseID, output.ResponseID),
+				}); err != nil {
+					return err
+				}
+			}
+		}
+		mergeGenerateOutput(result, output)
+		if output.Usage != (Usage{}) && onEvent != nil {
+			return onEvent(GenerateStreamEvent{
+				Usage:      output.Usage,
+				ResponseID: result.ResponseID,
+			})
+		}
+	case "response.failed", "response.error":
+		return parseResponsesStreamErrorEvent(parsed, rawBody)
+	}
+
+	return nil
+}
+
+func parseResponsesServerToolStatusEvent(eventType string, parsed map[string]interface{}) (ToolCall, bool) {
+	value := strings.TrimSpace(eventType)
+	if !strings.HasPrefix(value, "response.") {
+		return ToolCall{}, false
+	}
+	status := ""
+	for _, suffix := range []string{".in_progress", ".searching", ".generating", ".completed", ".failed", ".error"} {
+		if strings.HasSuffix(value, suffix) {
+			status = strings.TrimPrefix(suffix, ".")
+			value = strings.TrimSuffix(strings.TrimPrefix(value, "response."), suffix)
+			break
+		}
+	}
+	if status == "" || !isResponsesServerToolCallType(value) {
+		return ToolCall{}, false
+	}
+	item := cloneMap(asMap(parsed["item"]))
+	if len(item) == 0 {
+		item = make(map[string]interface{})
+	}
+	mergeMapValueIfEmpty(item, "type", value)
+	mergeMapValueIfEmpty(item, "status", status)
+	for _, key := range responseServerToolIdentifierKeys() {
+		mergeMapValueIfEmpty(item, key, parsed[key])
+	}
+	for _, key := range []string{"action", "arguments", "input", "query", "output", "outputs", "results", "search_results", "sources", "citations", "data", "items", "content", "response", "result", "error"} {
+		mergeMapValueIfEmpty(item, key, parsed[key])
+	}
+	return parseResponseServerToolCall(item), true
+}
+
+func responseServerToolIdentifierKeys() []string {
+	keys := []string{"item_id", "id", "call_id", "tool_call_id"}
+	for _, extension := range allResponsesProtocolExtensions() {
+		if extension.serverToolIdentifierKeys != nil {
+			keys = append(keys, extension.serverToolIdentifierKeys()...)
+		}
+	}
+	return keys
+}
+
+func mergeResponsesStreamOutputItem(
+	result *GenerateOutput,
+	item map[string]interface{},
+	onEvent func(GenerateStreamEvent) error,
+) error {
+	return mergeResponsesStreamOutputItemWithToolPolicy(result, "response.output_item", item, onEvent, true)
+}
+
+func mergeResponsesStreamOutputItemWithToolPolicy(
+	result *GenerateOutput,
+	eventType string,
+	item map[string]interface{},
+	onEvent func(GenerateStreamEvent) error,
+	allowNativeTools bool,
+) error {
+	if result == nil || len(item) == 0 {
+		return nil
+	}
+	if strings.TrimSpace(getString(item["type"])) == "reasoning" {
+		return mergeResponsesStreamReasoningItem(result, eventType, item, onEvent)
+	}
+	if !isResponsesServerToolCallItem(item) {
+		mergeResponsesOutputItemWithToolPolicy(result, item, false, allowNativeTools)
+		return nil
+	}
+	if !allowNativeTools {
+		return nil
+	}
+	call := parseResponseServerToolCall(item)
+	appendUniqueToolCall(&result.ServerToolCalls, call)
+	result.Citations = appendUniqueStrings(result.Citations, parseResponseCitations(item)...)
+	if onEvent == nil {
+		return nil
+	}
+	return onEvent(GenerateStreamEvent{
+		ServerToolCall: &call,
+		ResponseID:     result.ResponseID,
+	})
+}
+
+func mergeResponsesStreamReasoningItem(
+	result *GenerateOutput,
+	eventType string,
+	item map[string]interface{},
+	onEvent func(GenerateStreamEvent) error,
+) error {
+	var previous ReasoningOutput
+	if result.Reasoning != nil {
+		previous = *result.Reasoning
+	}
+
+	incoming := parseReasoningOutputItem(item)
+	mergeReasoningOutput(&result.Reasoning, incoming)
+	if incoming == nil || result.Reasoning == nil || onEvent == nil {
+		return nil
+	}
+
+	previousText := firstNonEmptyString(previous.Text, previous.Summary)
+	currentText := firstNonEmptyString(result.Reasoning.Text, result.Reasoning.Summary)
+	delta := appendedSnapshotDelta(previousText, currentText)
+	if delta == "" {
+		return nil
+	}
+
+	kind := "summary_text"
+	if strings.TrimSpace(result.Reasoning.Text) != "" {
+		kind = "content_text"
+	}
+	return onEvent(GenerateStreamEvent{
+		Reasoning: &ReasoningDelta{
+			EventType:        eventType,
+			ItemID:           result.Reasoning.ItemID,
+			Status:           result.Reasoning.Status,
+			Kind:             kind,
+			Text:             delta,
+			EncryptedContent: result.Reasoning.EncryptedContent,
+		},
+		ResponseID: result.ResponseID,
+	})
+}
+
+func appendedSnapshotDelta(previous string, current string) string {
+	if current == "" || current == previous {
+		return ""
+	}
+	if previous == "" {
+		return current
+	}
+	if strings.HasPrefix(current, previous) {
+		return strings.TrimPrefix(current, previous)
+	}
+	return ""
+}
+
+func mergeResponsesCustomToolInputEvent(
+	result *GenerateOutput,
+	parsed map[string]interface{},
+	onEvent func(GenerateStreamEvent) error,
+) error {
+	if result == nil {
+		return nil
+	}
+	itemID := firstNonEmptyString(getString(parsed["item_id"]), getString(parsed["call_id"]), getString(parsed["id"]))
+	if itemID == "" {
+		return nil
+	}
+	input := firstNonEmptyString(getString(parsed["delta"]), getString(parsed["input"]))
+	done := strings.HasSuffix(strings.TrimSpace(getString(parsed["type"])), ".done")
+	if call, ok := updateToolCallInput(&result.ServerToolCalls, itemID, input, done); ok {
+		if onEvent != nil {
+			return onEvent(GenerateStreamEvent{
+				ServerToolCall: &call,
+				ResponseID:     result.ResponseID,
+			})
+		}
+		return nil
+	}
+	updateToolCallInput(&result.ToolCalls, itemID, input, done)
+	return nil
+}
+
+func parseResponsesStreamErrorEvent(parsed map[string]interface{}, rawBody string) error {
+	errorPayload := asMap(parsed["error"])
+	if len(errorPayload) == 0 {
+		errorPayload = asMap(asMap(parsed["response"])["error"])
+	}
+	statusCode := streamErrorStatusCode(parsed, errorPayload)
+	message := firstNonEmptyString(
+		getString(errorPayload["message"]),
+		getString(errorPayload["msg"]),
+		getString(parsed["message"]),
+		"responses stream returned an error event",
+	)
+	return &UpstreamError{
+		StatusCode: statusCode,
+		Message:    message,
+		Body:       rawBody,
+	}
+}
+
+func parseResponsesOutput(adapter string, parsed map[string]interface{}, result *GenerateOutput) {
+	parseResponsesOutputWithToolPolicy(adapter, parsed, result, true)
+}
+
+func parseResponsesOutputWithToolPolicy(
+	adapter string,
+	parsed map[string]interface{},
+	result *GenerateOutput,
+	allowNativeTools bool,
+) {
+	result.Text = getString(parsed["output_text"])
+	outputItems := asSlice(parsed["output"])
+	textChunks := make([]string, 0, len(outputItems))
+
+	for _, raw := range outputItems {
+		item := asMap(raw)
+		if chunk := mergeResponsesOutputItemWithToolPolicy(result, item, true, allowNativeTools); chunk != "" {
+			textChunks = append(textChunks, chunk)
+		}
+	}
+
+	if result.Text == "" && len(textChunks) > 0 {
+		result.Text = strings.Join(textChunks, "")
+	}
+
+	if allowNativeTools {
+		mergeResponsesTopLevelToolCalls(result, parsed["tool_calls"])
+	}
+
+	result.Usage = parseOpenAICompatibleUsageForAdapter(adapter, parsed)
+	result.ServerSideToolUsage = parseServerSideToolUsage(parsed)
+	result.Citations = appendUniqueStrings(result.Citations, parseResponseCitations(parsed)...)
+}
+
+func mergeResponsesTopLevelToolCalls(result *GenerateOutput, raw interface{}) {
+	if result == nil {
+		return
+	}
+	for _, value := range asSlice(raw) {
+		item := asMap(value)
+		if len(item) == 0 {
+			continue
+		}
+		if isResponsesServerToolCallItem(item) {
+			appendUniqueToolCall(&result.ServerToolCalls, parseResponseServerToolCall(item))
+			result.Citations = appendUniqueStrings(result.Citations, parseResponseCitations(item)...)
+			continue
+		}
+		itemType := strings.TrimSpace(getString(item["type"]))
+		if isResponsesClientToolCallType(itemType) {
+			appendUniqueToolCall(&result.ToolCalls, parseResponseToolCall(item))
+		}
+	}
+}
+
+func mergeReasoningDeltaOutput(dst **ReasoningOutput, delta *ReasoningDelta) {
+	if delta == nil {
+		return
+	}
+	if *dst == nil {
+		*dst = &ReasoningOutput{}
+	}
+	if strings.TrimSpace(delta.ItemID) != "" {
+		(*dst).ItemID = strings.TrimSpace(delta.ItemID)
+	}
+	if strings.TrimSpace(delta.Status) != "" {
+		(*dst).Status = strings.TrimSpace(delta.Status)
+	}
+	switch delta.Kind {
+	case "summary_text":
+		(*dst).Summary += delta.Text
+	default:
+		(*dst).Text += delta.Text
+	}
+	if strings.TrimSpace(delta.Signature) != "" {
+		(*dst).Signature = strings.TrimSpace(delta.Signature)
+	}
+	if strings.TrimSpace(delta.EncryptedContent) != "" {
+		(*dst).EncryptedContent = strings.TrimSpace(delta.EncryptedContent)
+	}
+}
+
+func parseResponsesReasoningDelta(eventType string, parsed map[string]interface{}) *ReasoningDelta {
+	text := extractReasoningDeltaText(parsed["delta"])
+	if text == "" {
+		return nil
+	}
+
+	kind := "content_text"
+	if strings.Contains(eventType, "summary") {
+		kind = "summary_text"
+	}
+
+	return &ReasoningDelta{
+		EventType:        eventType,
+		ItemID:           firstNonEmptyString(getString(parsed["item_id"]), getStringFromPath(parsed, "item", "id")),
+		Status:           firstNonEmptyString(getString(parsed["status"]), getStringFromPath(parsed, "item", "status")),
+		Kind:             kind,
+		Text:             text,
+		EncryptedContent: firstNonEmptyString(getString(parsed["encrypted_content"]), getStringFromPath(parsed, "item", "encrypted_content")),
+	}
+}
+
+func parseResponsesReasoningDone(eventType string, parsed map[string]interface{}) *ReasoningDelta {
+	text := firstNonEmptyString(
+		extractReasoningDeltaText(parsed["text"]),
+		extractReasoningDeltaText(parsed["summary"]),
+		extractReasoningDeltaText(parsed["delta"]),
+	)
+	if text == "" {
+		return nil
+	}
+
+	kind := "content_text"
+	if strings.Contains(eventType, "summary") {
+		kind = "summary_text"
+	}
+
+	return &ReasoningDelta{
+		EventType:        eventType,
+		ItemID:           firstNonEmptyString(getString(parsed["item_id"]), getStringFromPath(parsed, "item", "id")),
+		Status:           firstNonEmptyString(getString(parsed["status"]), getStringFromPath(parsed, "item", "status")),
+		Kind:             kind,
+		Text:             text,
+		EncryptedContent: firstNonEmptyString(getString(parsed["encrypted_content"]), getStringFromPath(parsed, "item", "encrypted_content")),
+	}
+}
+
+func reasoningOutputContains(output *ReasoningOutput, text string) bool {
+	if output == nil || strings.TrimSpace(text) == "" {
+		return false
+	}
+	return strings.Contains(output.Text, text) || strings.Contains(output.Summary, text)
+}
+
+func parseReasoningOutputItem(item map[string]interface{}) *ReasoningOutput {
+	if len(item) == 0 {
+		return nil
+	}
+
+	summaryParts := make([]string, 0)
+	for _, raw := range asSliceOrSingleton(item["summary"]) {
+		if text := extractReasoningDeltaText(raw); text != "" {
+			summaryParts = append(summaryParts, text)
+		}
+	}
+
+	contentParts := make([]string, 0)
+	for _, raw := range asSliceOrSingleton(item["content"]) {
+		if text := extractReasoningDeltaText(raw); text != "" {
+			contentParts = append(contentParts, text)
+		}
+	}
+
+	text := strings.Join(contentParts, "")
+	if text == "" {
+		text = extractReasoningDeltaText(item["text"])
+	}
+
+	result := &ReasoningOutput{
+		ItemID:           getString(item["id"]),
+		Status:           getString(item["status"]),
+		Summary:          strings.Join(summaryParts, ""),
+		Text:             text,
+		EncryptedContent: getString(item["encrypted_content"]),
+	}
+	if strings.TrimSpace(result.ItemID) == "" &&
+		strings.TrimSpace(result.Status) == "" &&
+		strings.TrimSpace(result.Summary) == "" &&
+		strings.TrimSpace(result.Text) == "" &&
+		strings.TrimSpace(result.EncryptedContent) == "" {
+		return nil
+	}
+	return result
+}
+
+func mergeReasoningOutput(dst **ReasoningOutput, src *ReasoningOutput) {
+	if src == nil {
+		return
+	}
+	if *dst == nil {
+		value := *src
+		*dst = &value
+		return
+	}
+	if strings.TrimSpace(src.ItemID) != "" {
+		(*dst).ItemID = strings.TrimSpace(src.ItemID)
+	}
+	if strings.TrimSpace(src.Status) != "" {
+		(*dst).Status = strings.TrimSpace(src.Status)
+	}
+	if strings.TrimSpace(src.Summary) != "" {
+		(*dst).Summary = strings.TrimSpace(src.Summary)
+	}
+	if strings.TrimSpace(src.Text) != "" {
+		(*dst).Text = strings.TrimSpace(src.Text)
+	}
+	if strings.TrimSpace(src.Signature) != "" {
+		(*dst).Signature = strings.TrimSpace(src.Signature)
+	}
+	if strings.TrimSpace(src.EncryptedContent) != "" {
+		(*dst).EncryptedContent = strings.TrimSpace(src.EncryptedContent)
+	}
+}
+
+func mergeResponsesOutputItem(result *GenerateOutput, item map[string]interface{}, collectText bool) string {
+	return mergeResponsesOutputItemWithToolPolicy(result, item, collectText, true)
+}
+
+func mergeResponsesOutputItemWithToolPolicy(
+	result *GenerateOutput,
+	item map[string]interface{},
+	collectText bool,
+	allowNativeTools bool,
+) string {
+	if result == nil || len(item) == 0 {
+		return ""
+	}
+	itemType := strings.TrimSpace(getString(item["type"]))
+	switch {
+	case itemType == "reasoning":
+		mergeReasoningOutput(&result.Reasoning, parseReasoningOutputItem(item))
+	case isResponsesServerToolCallItem(item):
+		if !allowNativeTools {
+			return ""
+		}
+		if image, ok := parseResponsesGeneratedImage(item); ok {
+			result.GeneratedImages = appendUniqueGeneratedImage(result.GeneratedImages, image)
+		}
+		appendUniqueToolCall(&result.ServerToolCalls, parseResponseServerToolCall(item))
+		result.Citations = appendUniqueStrings(result.Citations, parseResponseCitations(item)...)
+	case isResponsesClientToolCallType(itemType):
+		if allowNativeTools {
+			appendUniqueToolCall(&result.ToolCalls, parseResponseToolCall(item))
+		}
+	default:
+		result.Citations = appendUniqueStrings(result.Citations, parseResponseCitations(item)...)
+		if collectText {
+			return extractOutputTextChunk(item)
+		}
+	}
+	return ""
+}
+
+func parseResponseToolCall(item map[string]interface{}) ToolCall {
+	arguments := normalizeJSONString(item["arguments"])
+	if arguments == "" {
+		arguments = normalizeJSONString(item["input"])
+	}
+	if arguments == "" {
+		arguments = "{}"
+	}
+
+	toolCallID := strings.TrimSpace(getString(item["call_id"]))
+	if toolCallID == "" {
+		toolCallID = strings.TrimSpace(getString(item["id"]))
+	}
+
+	toolName := strings.TrimSpace(getString(item["name"]))
+	if toolName == "" {
+		toolName = strings.TrimSpace(getStringFromPath(item, "function", "name"))
+	}
+
+	toolType := strings.TrimSpace(getString(item["type"]))
+	if toolType == "" {
+		toolType = "function"
+	}
+
+	status := strings.TrimSpace(getString(item["status"]))
+	if status == "" {
+		status = "requested"
+	}
+
+	return ToolCall{
+		ToolCallID:    toolCallID,
+		ToolType:      toolType,
+		ToolName:      toolName,
+		ArgumentsJSON: arguments,
+		Status:        status,
+	}
+}
+
+func parseResponseServerToolCall(item map[string]interface{}) ToolCall {
+	itemType := strings.TrimSpace(getString(item["type"]))
+	if itemType == "" {
+		itemType = "server_tool_call"
+	}
+	toolCallID := responseServerToolCallID(item, itemType)
+	toolName := firstNonEmptyString(getString(item["name"]), responseServerToolNameFromType(itemType))
+	status := firstNonEmptyString(getString(item["status"]), "completed")
+	actionInputJSON, actionOutputJSON := splitResponsesServerToolAction(item["action"])
+	inputJSON := firstNonEmptyString(
+		actionInputJSON,
+		normalizeJSONString(item["arguments"]),
+		normalizeJSONString(item["input"]),
+		normalizeJSONString(item["query"]),
+	)
+	outputJSON := firstNonEmptyString(
+		normalizeJSONString(item["output"]),
+		normalizeJSONString(item["outputs"]),
+		normalizeJSONString(item["results"]),
+		normalizeJSONString(item["search_results"]),
+		normalizeJSONString(item["sources"]),
+		normalizeJSONString(item["citations"]),
+		normalizeJSONString(item["data"]),
+		normalizeJSONString(item["items"]),
+		normalizeJSONString(item["content"]),
+		normalizeJSONString(item["response"]),
+		normalizeJSONString(item["result"]),
+		actionOutputJSON,
+	)
+	if isResponsesImageGenerationCallType(itemType) {
+		outputJSON = responsesImageGenerationToolOutputJSON(item)
+	}
+	errorJSON := normalizeJSONString(item["error"])
+	return ToolCall{
+		ToolCallID:    toolCallID,
+		ToolType:      itemType,
+		ToolName:      toolName,
+		ArgumentsJSON: inputJSON,
+		Status:        status,
+		OutputJSON:    outputJSON,
+		ErrorJSON:     errorJSON,
+	}
+}
+
+// parseResponsesPartialImage 解析 Responses 图片生成过程中的预览帧。
+func parseResponsesPartialImage(parsed map[string]interface{}) (GeneratedImage, bool) {
+	b64 := strings.TrimSpace(getString(parsed["partial_image_b64"]))
+	if b64 == "" {
+		return GeneratedImage{}, false
+	}
+	return GeneratedImage{
+		B64JSON:  b64,
+		MIMEType: openAIImageMIMEType(getString(parsed["output_format"])),
+	}, true
+}
+
+// parseResponsesGeneratedImage 从最终 image_generation_call 中提取可持久化图片。
+func parseResponsesGeneratedImage(item map[string]interface{}) (GeneratedImage, bool) {
+	if !isResponsesImageGenerationCallType(getString(item["type"])) {
+		return GeneratedImage{}, false
+	}
+	outputFormat := getString(item["output_format"])
+	revisedPrompt := strings.TrimSpace(getString(item["revised_prompt"]))
+	if b64 := strings.TrimSpace(getString(item["result"])); b64 != "" {
+		return GeneratedImage{
+			B64JSON:       b64,
+			MIMEType:      openAIImageMIMEType(outputFormat),
+			RevisedPrompt: revisedPrompt,
+		}, true
+	}
+	image, ok := parseOpenAIImagePayload(asMap(item["result"]), outputFormat)
+	if !ok {
+		image, ok = parseOpenAIImagePayload(item, outputFormat)
+	}
+	if !ok {
+		return GeneratedImage{}, false
+	}
+	if image.RevisedPrompt == "" {
+		image.RevisedPrompt = revisedPrompt
+	}
+	return image, true
+}
+
+// appendUniqueGeneratedImage 合并同一响应内重复出现的最终图片结果。
+func appendUniqueGeneratedImage(images []GeneratedImage, image GeneratedImage) []GeneratedImage {
+	for _, existing := range images {
+		if existing.B64JSON != "" && existing.B64JSON == image.B64JSON {
+			return images
+		}
+		if existing.URL != "" && existing.URL == image.URL {
+			return images
+		}
+	}
+	return append(images, image)
+}
+
+// isResponsesImageGenerationCallType 判断 Responses 输出项是否为图片生成结果。
+func isResponsesImageGenerationCallType(itemType string) bool {
+	switch strings.TrimSpace(itemType) {
+	case "image_generation_call", "image_generation_call_output":
+		return true
+	default:
+		return false
+	}
+}
+
+// responsesImageGenerationToolOutputJSON 只保留图片工具元数据，避免把 base64 写入 trace。
+func responsesImageGenerationToolOutputJSON(item map[string]interface{}) string {
+	payload := make(map[string]interface{})
+	for _, key := range []string{"background", "output_format", "quality", "revised_prompt", "size", "status"} {
+		if value, ok := item[key]; ok {
+			payload[key] = value
+		}
+	}
+	if _, ok := parseResponsesGeneratedImage(item); ok {
+		payload["image_generated"] = true
+	}
+	if result := asMap(item["result"]); len(result) > 0 {
+		if imageURL := strings.TrimSpace(getString(result["url"])); imageURL != "" {
+			payload["url"] = imageURL
+		}
+	}
+	return normalizeJSONString(payload)
+}
+
+func responseServerToolCallID(item map[string]interface{}, itemType string) string {
+	for _, extension := range allResponsesProtocolExtensions() {
+		if extension.serverToolCallID == nil {
+			continue
+		}
+		if toolCallID, ok := extension.serverToolCallID(item, itemType); ok {
+			return toolCallID
+		}
+	}
+	return firstNonEmptyString(
+		getString(item["item_id"]),
+		getString(item["call_id"]),
+		getString(item["id"]),
+		getString(item["tool_call_id"]),
+	)
+}
+
+func responseServerToolNameFromType(itemType string) string {
+	value := strings.TrimSpace(itemType)
+	for _, suffix := range []string{"_call_output", "_call"} {
+		value = strings.TrimSuffix(value, suffix)
+	}
+	return value
+}
+
+func splitResponsesServerToolAction(raw interface{}) (string, string) {
+	action := asMap(raw)
+	if len(action) == 0 {
+		return normalizeJSONString(raw), ""
+	}
+	input := cloneMap(action)
+	delete(input, "sources")
+	output := make(map[string]interface{})
+	if query := strings.TrimSpace(getString(action["query"])); query != "" {
+		output["query"] = query
+	}
+	if actionType := strings.TrimSpace(getString(action["type"])); actionType != "" {
+		output["type"] = actionType
+	}
+	if sources := asSlice(action["sources"]); len(sources) > 0 {
+		output["sources"] = sources
+	}
+	outputJSON := ""
+	if len(output) > 0 && len(asSlice(output["sources"])) > 0 {
+		outputJSON = normalizeJSONString(output)
+	}
+	return normalizeJSONString(input), outputJSON
+}
+
+func isResponsesServerToolCallItem(item map[string]interface{}) bool {
+	itemType := strings.TrimSpace(getString(item["type"]))
+	if isResponsesServerToolCallType(itemType) {
+		return true
+	}
+	for _, extension := range allResponsesProtocolExtensions() {
+		if extension.isServerToolCallItem != nil && extension.isServerToolCallItem(item) {
+			return true
+		}
+	}
+	return false
+}
+
+func isResponsesServerToolCallType(itemType string) bool {
+	switch strings.TrimSpace(itemType) {
+	case "web_search_call",
+		"web_search_call_output",
+		"file_search_call",
+		"file_search_call_output",
+		"code_interpreter_call",
+		"code_interpreter_call_output",
+		"code_execution_call",
+		"code_execution_call_output",
+		"collections_search_call",
+		"collections_search_call_output",
+		"attachment_search_call",
+		"attachment_search_call_output",
+		"computer_call",
+		"computer_call_output",
+		"mcp_call",
+		"mcp_call_output",
+		"image_generation_call",
+		"image_generation_call_output",
+		"shell_call",
+		"shell_call_output",
+		"local_shell_call",
+		"local_shell_call_output":
+		return true
+	default:
+		for _, extension := range allResponsesProtocolExtensions() {
+			if extension.isServerToolCallType != nil && extension.isServerToolCallType(itemType) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+func isResponsesClientToolCallType(itemType string) bool {
+	value := strings.TrimSpace(itemType)
+	if value == "" {
+		return false
+	}
+	if value == "function_call" || value == "tool_call" || value == "custom_tool_call" {
+		return true
+	}
+	return strings.HasSuffix(value, "_tool_call") && !isResponsesServerToolCallType(value)
+}
+
+func parseResponseCitations(parsed map[string]interface{}) []string {
+	if len(parsed) == 0 {
+		return nil
+	}
+	result := make([]string, 0)
+	for _, key := range []string{"citations", "sources", "urls"} {
+		for _, raw := range asSlice(parsed[key]) {
+			if text := firstNonEmptyString(getString(raw), getStringFromPath(asMap(raw), "url"), getStringFromPath(asMap(raw), "uri")); text != "" {
+				result = append(result, text)
+			}
+		}
+	}
+	collectResponseCitationURLs(parsed, &result)
+	return appendUniqueStrings(nil, result...)
+}
+
+func collectResponseCitationURLs(raw interface{}, result *[]string) {
+	if result == nil {
+		return
+	}
+	switch value := raw.(type) {
+	case []interface{}:
+		for _, item := range value {
+			collectResponseCitationURLs(item, result)
+		}
+	case map[string]interface{}:
+		itemType := strings.TrimSpace(getString(value["type"]))
+		switch itemType {
+		case "url_citation", "file_citation":
+			if text := firstNonEmptyString(
+				getString(value["url"]),
+				getString(value["uri"]),
+				getStringFromPath(value, "url_citation", "url"),
+				getStringFromPath(value, "file_citation", "url"),
+			); text != "" {
+				*result = append(*result, text)
+			}
+		}
+		if text := firstNonEmptyString(getString(value["url"]), getString(value["uri"])); text != "" {
+			*result = append(*result, text)
+		}
+		for _, key := range []string{"action", "content", "annotations", "output", "outputs", "results", "search_results", "sources", "citations", "url_citation", "file_citation", "data", "items", "response", "result"} {
+			collectResponseCitationURLs(value[key], result)
+		}
+	}
+}
+
+func parseServerSideToolUsage(parsed map[string]interface{}) map[string]int64 {
+	usage := asMap(parsed["usage"])
+	if len(usage) == 0 {
+		return nil
+	}
+	raw := asMap(usage["server_side_tool_usage"])
+	if len(raw) == 0 {
+		raw = asMap(usage["tool_usage"])
+	}
+	if len(raw) == 0 {
+		raw = asMap(usage["server_side_tool_usage_details"])
+	}
+	if len(raw) == 0 {
+		return nil
+	}
+	result := make(map[string]int64, len(raw))
+	for key, value := range raw {
+		if normalized := normalizeServerSideToolUsageKey(key); normalized != "" {
+			result[normalized] = toInt64(value)
+		}
+	}
+	return result
+}
+
+func normalizeServerSideToolUsageKey(key string) string {
+	value := strings.TrimSpace(key)
+	value = strings.TrimSuffix(value, "_calls")
+	value = strings.TrimSuffix(value, "_call")
+	switch value {
+	case "web_search", "code_interpreter", "image_generation", "shell", "file_search", "mcp", "document_search":
+		return value
+	default:
+		for _, extension := range allResponsesProtocolExtensions() {
+			if extension.normalizeServerSideToolUsageKey == nil {
+				continue
+			}
+			if normalized, ok := extension.normalizeServerSideToolUsageKey(value, key); ok {
+				return normalized
+			}
+		}
+		return key
+	}
+}
+
+func extractOutputTextChunk(item map[string]interface{}) string {
+	if chunk := extractContentText(item["content"]); chunk != "" {
+		return chunk
+	}
+	if chunk := getString(item["text"]); chunk != "" {
+		return chunk
+	}
+	return ""
+}

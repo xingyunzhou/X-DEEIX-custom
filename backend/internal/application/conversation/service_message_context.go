@@ -1,0 +1,1690 @@
+package conversation
+
+import (
+	"context"
+	"encoding/json"
+	"encoding/xml"
+	"errors"
+	"fmt"
+	"io"
+	"sort"
+	"strings"
+
+	appbilling "github.com/DEEIX-AI/DEEIX-Chat/backend/internal/application/billing"
+	appchannel "github.com/DEEIX-AI/DEEIX-Chat/backend/internal/application/channel"
+	appdoccard "github.com/DEEIX-AI/DEEIX-Chat/backend/internal/application/doccard"
+	appstorage "github.com/DEEIX-AI/DEEIX-Chat/backend/internal/application/objectstorage"
+	domainconversation "github.com/DEEIX-AI/DEEIX-Chat/backend/internal/domain/conversation"
+	domainmemory "github.com/DEEIX-AI/DEEIX-Chat/backend/internal/domain/memory"
+	"github.com/DEEIX-AI/DEEIX-Chat/backend/internal/infra/config"
+	"github.com/DEEIX-AI/DEEIX-Chat/backend/internal/ports/llm"
+	"github.com/DEEIX-AI/DEEIX-Chat/backend/internal/ports/objectstore"
+	"github.com/DEEIX-AI/DEEIX-Chat/backend/internal/pkg/conv"
+	"github.com/DEEIX-AI/DEEIX-Chat/backend/internal/shared/apperr"
+)
+
+const (
+	MessageErrorCodeUpstreamRateLimited           = "upstream.rate_limited"
+	MessageErrorCodeUpstreamEmptyResponse         = "llm.empty_response"
+	MessageErrorCodeMediaImageStreamUnsupported   = "media.image_stream_unsupported"
+	MessageErrorCodeKnowledgeBaseInvalidReference = "knowledge_base.invalid_reference"
+	MessageErrorCodeKnowledgeBaseUnavailable      = "knowledge_base.unavailable"
+	MessageErrorCodeKnowledgeBaseNotReady         = "knowledge_base.not_ready"
+	messageErrorCodeInternal                      = "internal.error"
+)
+
+const (
+	maxConversationImageContextCount = 10
+	maxConversationImageContextBytes = 20 * 1024 * 1024
+	maxConversationImageSourceBytes  = 50 * 1024 * 1024
+)
+
+func normalizePublicID(raw string) string {
+	return conv.NormalizePublicID(raw)
+}
+
+// isCJKRune 判断字符是否属于 CJK 字符范围（中文、日文、韩文）。
+func isCJKRune(r rune) bool {
+	return (r >= 0x2E80 && r <= 0x9FFF) || // CJK 部首、假名、统一表意文字
+		(r >= 0xAC00 && r <= 0xD7AF) || // 韩文音节
+		(r >= 0xF900 && r <= 0xFAFF) || // CJK 兼容汉字
+		(r >= 0x20000 && r <= 0x2A6DF) // CJK 扩展 B
+}
+
+// estimateTokens 估算文本 token 数，区分 CJK 与其他字符权重。
+// CJK 字符：约 1.5 chars/token；ASCII 及其他：约 4 chars/token。
+func estimateTokens(content string) int64 {
+	if len(content) == 0 {
+		return 0
+	}
+	var cjk, other int64
+	for _, r := range content {
+		if isCJKRune(r) {
+			cjk++
+		} else {
+			other++
+		}
+	}
+	// CJK: tokens = ceil(cjk * 2/3)；other: tokens = ceil(other / 4)
+	tokens := (cjk*2+2)/3 + (other+3)/4
+	if tokens == 0 {
+		return 1
+	}
+	return tokens
+}
+
+func estimateContentPartTokens(part llm.ContentPart) int64 {
+	switch part.Kind {
+	case llm.ContentPartImage:
+		return 255
+	case llm.ContentPartFile:
+		return estimateTokens(part.FileName) + estimateTokens(part.Text) + 8
+	default:
+		return estimateTokens(part.Text)
+	}
+}
+
+func estimateMessageTokens(message llm.Message) int64 {
+	var tokens int64 = 4
+	if message.Role != "" {
+		tokens += 1
+	}
+	if len(message.Parts) > 0 {
+		for _, part := range message.Parts {
+			tokens += estimateContentPartTokens(part)
+		}
+	} else {
+		tokens += estimateTokens(message.Content)
+	}
+	tokens += estimateTokens(message.ReasoningContent)
+	for _, call := range message.ToolCalls {
+		tokens += estimateTokens(call.ToolCallID)
+		tokens += estimateTokens(call.ToolName)
+		tokens += estimateTokens(call.ArgumentsJSON)
+		tokens += 8
+	}
+	for _, result := range message.ToolResults {
+		tokens += estimateTokens(result.ToolCallID)
+		tokens += estimateTokens(result.ToolName)
+		tokens += estimateTokens(result.OutputJSON)
+		tokens += estimateTokens(result.Error)
+		tokens += 8
+	}
+	return tokens
+}
+
+func estimatePromptTokens(messages []llm.Message) int64 {
+	var tokens int64 = 2
+	for _, message := range messages {
+		tokens += estimateMessageTokens(message)
+	}
+	if tokens < 0 {
+		return 0
+	}
+	return tokens
+}
+
+func compactSnippet(content string, maxLen int) string {
+	value := strings.Join(strings.Fields(strings.TrimSpace(content)), " ")
+	if value == "" {
+		return ""
+	}
+	if maxLen <= 0 {
+		maxLen = 120
+	}
+	runes := []rune(value)
+	if len(runes) <= maxLen {
+		return value
+	}
+	return string(runes[:maxLen]) + "..."
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if normalized := strings.TrimSpace(value); normalized != "" {
+			return normalized
+		}
+	}
+	return ""
+}
+
+func buildContextPolicyJSON(cfg config.Config) string {
+	policy := map[string]interface{}{
+		"max_turns":                     cfg.ContextMaxTurns,
+		"max_input_tokens":              cfg.ContextMaxInputTokens,
+		"compact_enabled":               cfg.ContextCompactEnabled,
+		"compact_trigger_tokens":        cfg.ContextCompactTrigger,
+		"compact_preserve_recent_turns": cfg.ContextCompactPreserve,
+	}
+	raw, err := json.Marshal(policy)
+	if err != nil {
+		return "{}"
+	}
+	return string(raw)
+}
+
+func truncateError(message string, limit int) string {
+	value := strings.TrimSpace(message)
+	if limit <= 0 || len([]rune(value)) <= limit {
+		return value
+	}
+	runes := []rune(value)
+	return string(runes[:limit])
+}
+
+func getStringFromAny(raw interface{}) string {
+	return conv.GetStringFromAny(raw)
+}
+
+func getIntFromAny(raw interface{}) int {
+	return conv.GetIntFromAny(raw)
+}
+
+func inferProvider(platformModelName string) string {
+	code := strings.ToLower(strings.TrimSpace(platformModelName))
+	switch {
+	case strings.HasPrefix(code, "gpt-"):
+		return "openai"
+	case strings.HasPrefix(code, "claude-"):
+		return "anthropic"
+	default:
+		return "internal"
+	}
+}
+
+func classifyRunErrorCode(err error) string {
+	if errors.Is(err, appbilling.ErrUsageBalanceInsufficient) {
+		return messageUsageBalanceErrorCode
+	}
+	if errors.Is(err, ErrGeneratedMediaArtifactUnavailable) {
+		return MessageErrorCodeMediaArtifactUnavailable
+	}
+	if errors.Is(err, ErrMediaArtifactPending) {
+		return "media.artifact_pending"
+	}
+	var upstreamErr *llm.UpstreamError
+	if errors.As(err, &upstreamErr) && isImageStreamConfigurationFailure(upstreamErr) {
+		return MessageErrorCodeMediaImageStreamUnsupported
+	}
+	switch {
+	case errors.Is(err, ErrConversationNotFound):
+		return "conversation_not_found"
+	case errors.Is(err, ErrInvalidFileReference):
+		return "invalid_file_reference"
+	case errors.Is(err, ErrFileNotFound):
+		return "file_not_found"
+	case errors.Is(err, ErrStorageQuotaExceeded):
+		return "file.storage_quota_exceeded"
+	case errors.Is(err, ErrFileTooLarge):
+		return "file_too_large"
+	case errors.Is(err, ErrInvalidKnowledgeBaseReference):
+		return MessageErrorCodeKnowledgeBaseInvalidReference
+	case errors.Is(err, ErrKnowledgeBaseUnavailable):
+		return MessageErrorCodeKnowledgeBaseUnavailable
+	case errors.Is(err, ErrKnowledgeBaseNotReady):
+		return MessageErrorCodeKnowledgeBaseNotReady
+	case errors.Is(err, ErrModelRouteNotConfigured):
+		return "model_route_not_configured"
+	case errors.Is(err, ErrUpstreamEmptyResponse):
+		return "upstream_empty_response"
+	case errors.Is(err, ErrToolRunFinalAnswerMissing):
+		// 带点分段，与前端 errors.json 的 toolRun.finalAnswerMissing 嵌套结构一致。
+		return "tool_run.final_answer_missing"
+	case errors.Is(err, ErrMessageGenerationCanceled):
+		return "conversation_run.canceled"
+	case errors.Is(err, ErrMediaImagePromptRequired):
+		return "media_image_prompt_required"
+	case errors.Is(err, ErrMediaImageGenerationRejectsInputs):
+		return "media_image_generation_rejects_inputs"
+	case errors.Is(err, ErrMediaImageEditInputRequired):
+		return "media_image_edit_input_required"
+	case errors.Is(err, ErrMediaImageEditTooManyInputs):
+		return "media_image_edit_too_many_inputs"
+	case errors.Is(err, ErrMediaImageEditInputInvalid):
+		return "media_image_edit_input_invalid"
+	case errors.Is(err, ErrMediaVideoPromptRequired):
+		return "media_video_prompt_required"
+	case errors.Is(err, ErrMediaVideoInputInvalid):
+		return "media_video_input_invalid"
+	case errors.Is(err, ErrMediaVideoTooManyInputs):
+		return "media_video_too_many_inputs"
+	case errors.Is(err, ErrMediaRouteProtocolMismatch):
+		return "media_route_protocol_mismatch"
+	case errors.Is(err, ErrUpstreamRequestFailed):
+		return "upstream_request_failed"
+	default:
+		return messageErrorCodeInternal
+	}
+}
+
+func messageErrorSummary(err error) string {
+	if err == nil {
+		return ""
+	}
+	var upstreamErr *llm.UpstreamError
+	if errors.As(err, &upstreamErr) {
+		return upstreamErrorSummary(upstreamErr)
+	}
+	switch {
+	case errors.Is(err, ErrGeneratedMediaArtifactUnavailable):
+		return ErrGeneratedMediaArtifactUnavailable.Error()
+	case errors.Is(err, ErrMessageGenerationCanceled):
+		return ErrMessageGenerationCanceled.Error()
+	case errors.Is(err, ErrUpstreamRequestFailed):
+		return "upstream service unavailable"
+	case errors.Is(err, ErrStorageQuotaExceeded):
+		return "quota exceeded"
+	case errors.Is(err, ErrToolRunFinalAnswerMissing):
+		return "tool run ended without a final answer"
+	}
+	if coded, ok := apperr.Find(err); ok {
+		if message := strings.TrimSpace(coded.Message()); message != "" {
+			return message
+		}
+	}
+	return "internal server error"
+}
+
+func isMessageGenerationCanceledError(err error) bool {
+	return errors.Is(err, ErrMessageGenerationCanceled)
+}
+
+func messageErrorDebug(err error) *llm.UpstreamDebugSnapshot {
+	if err == nil {
+		return nil
+	}
+	var upstreamErr *llm.UpstreamError
+	if errors.As(err, &upstreamErr) {
+		return sanitizeUpstreamDebugSnapshot(upstreamErr.Debug)
+	}
+	return nil
+}
+
+func sanitizeUpstreamDebugSnapshot(debug *llm.UpstreamDebugSnapshot) *llm.UpstreamDebugSnapshot {
+	if debug == nil {
+		return nil
+	}
+	requestBodyBytes := debug.Request.BodyBytes
+	if requestBodyBytes == 0 {
+		requestBodyBytes = len(debug.Request.Body)
+	}
+	requestRedactedParts := debug.Request.RedactedParts
+	if debug.Request.Body != "" {
+		requestRedactedParts++
+	}
+	return &llm.UpstreamDebugSnapshot{
+		Request: llm.UpstreamDebugRequest{
+			Method:        debug.Request.Method,
+			Path:          debug.Request.Path,
+			BodyBytes:     requestBodyBytes,
+			BodyTruncated: debug.Request.BodyTruncated,
+			RedactedParts: requestRedactedParts,
+		},
+		Response: llm.UpstreamDebugResponse{
+			StatusCode:    debug.Response.StatusCode,
+			Body:          sanitizeUpstreamNameJSON(llm.SanitizeUpstreamDebugBody(debug.Response.Body)),
+			BodyBytes:     debug.Response.BodyBytes,
+			BodyTruncated: debug.Response.BodyTruncated,
+			RedactedParts: debug.Response.RedactedParts,
+		},
+	}
+}
+
+func sanitizeUpstreamNameJSON(raw string) string {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return raw
+	}
+	var payload interface{}
+	if err := json.Unmarshal([]byte(value), &payload); err != nil {
+		return raw
+	}
+	deleteUpstreamNameValues(payload, "")
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return raw
+	}
+	return string(data)
+}
+
+func deleteUpstreamNameValues(value interface{}, parentKey string) {
+	switch current := value.(type) {
+	case map[string]interface{}:
+		for key, child := range current {
+			if isUpstreamNameKey(key, parentKey) {
+				delete(current, key)
+				continue
+			}
+			deleteUpstreamNameValues(child, key)
+		}
+	case []interface{}:
+		for _, child := range current {
+			deleteUpstreamNameValues(child, parentKey)
+		}
+	}
+}
+
+func isUpstreamNameKey(key string, parentKey string) bool {
+	normalized := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(key), "_", ""))
+	if normalized == "upstreamname" {
+		return true
+	}
+	return strings.ToLower(strings.TrimSpace(parentKey)) == "upstream" && (normalized == "name" || normalized == "displayname")
+}
+
+func upstreamErrorSummary(err *llm.UpstreamError) string {
+	if err == nil {
+		return ""
+	}
+	lines := make([]string, 0, 3)
+	hint := imageStreamConfigurationHint(err)
+	if isSuccessfulUpstreamStatus(err.StatusCode) {
+		lines = append(lines, fmt.Sprintf("模型响应格式不兼容（HTTP %d）", err.StatusCode))
+		lines = append(lines, "错误：上游返回成功状态码，但响应格式与当前协议不兼容")
+		if hint != "" {
+			lines = append(lines, hint)
+		}
+		return strings.Join(lines, "\n")
+	}
+	if err.StatusCode > 0 {
+		lines = append(lines, fmt.Sprintf("模型请求失败（HTTP %d）", err.StatusCode))
+	} else {
+		lines = append(lines, "模型请求失败")
+	}
+	if message := normalizeUpstreamErrorMessage(err.Message); message != "" {
+		lines = append(lines, "错误："+message)
+	}
+	if hint != "" {
+		lines = append(lines, hint)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func isSuccessfulUpstreamStatus(statusCode int) bool {
+	return statusCode >= 200 && statusCode < 300
+}
+
+func normalizeUpstreamErrorMessage(message string) string {
+	value := strings.TrimSpace(message)
+	if value == "" || looksLikeRawSSEBody(value) {
+		return ""
+	}
+	return value
+}
+
+func looksLikeRawSSEBody(value string) bool {
+	normalized := strings.TrimSpace(value)
+	return strings.HasPrefix(normalized, "data:") ||
+		strings.Contains(normalized, "\ndata:") ||
+		strings.Contains(normalized, " data:")
+}
+
+func imageStreamConfigurationHint(err *llm.UpstreamError) string {
+	if !isImageStreamConfigurationFailure(err) {
+		return ""
+	}
+	return "Tips：当前上游可能不支持流式响应，请管理员在模型能力中关闭“图像流式调用”（设置 image.stream=false）后重试。"
+}
+
+func isImageStreamConfigurationFailure(err *llm.UpstreamError) bool {
+	return err != nil && isImageStreamingUpstreamRequest(err.Debug) && isStreamingResponseFormatFailure(err)
+}
+
+func isImageStreamingUpstreamRequest(debug *llm.UpstreamDebugSnapshot) bool {
+	if debug == nil {
+		return false
+	}
+	path := strings.ToLower(strings.TrimSpace(debug.Request.Path))
+	body := strings.TrimSpace(debug.Request.Body)
+	if strings.Contains(path, "/images/") {
+		return jsonObjectFieldIsTrue(body, "stream")
+	}
+	if strings.Contains(path, ":streamgeneratecontent") {
+		return geminiImageResponseRequested(body)
+	}
+	return false
+}
+
+func jsonObjectFieldIsTrue(raw string, key string) bool {
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &payload); err != nil {
+		return false
+	}
+	switch value := payload[key].(type) {
+	case bool:
+		return value
+	case string:
+		return strings.EqualFold(strings.TrimSpace(value), "true")
+	default:
+		return false
+	}
+}
+
+func geminiImageResponseRequested(raw string) bool {
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &payload); err != nil {
+		return false
+	}
+	config, ok := payload["generationConfig"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	return containsImageModality(config["responseModalities"])
+}
+
+func containsImageModality(raw interface{}) bool {
+	switch value := raw.(type) {
+	case string:
+		return strings.EqualFold(strings.TrimSpace(value), "image")
+	case []interface{}:
+		for _, item := range value {
+			if containsImageModality(item) {
+				return true
+			}
+		}
+	case []string:
+		for _, item := range value {
+			if containsImageModality(item) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isStreamingResponseFormatFailure(err *llm.UpstreamError) bool {
+	detail := strings.ToLower(strings.TrimSpace(err.Message + "\n" + err.Body))
+	if err.Debug != nil {
+		detail = strings.TrimSpace(detail + "\n" + strings.ToLower(err.Debug.Response.Body))
+	}
+	if detail == "" {
+		return false
+	}
+	if strings.Contains(detail, "invalid character") && strings.Contains(detail, "looking for beginning of value") {
+		return true
+	}
+	return isStreamUnsupportedError(err)
+}
+
+func wrapUpstreamRequestError(cause error) error {
+	if cause == nil {
+		return ErrUpstreamRequestFailed
+	}
+	return fmt.Errorf("%w: %w", ErrUpstreamRequestFailed, cause)
+}
+
+// MessageErrorSummary 返回适合边界层展示的错误摘要。
+func MessageErrorSummary(err error) string {
+	return messageErrorSummary(err)
+}
+
+// MessageErrorCode 返回适合边界层和前端本地化使用的稳定错误码。
+func IsUpstreamRateLimitError(err error) bool {
+	if errors.Is(err, appchannel.ErrAllRoutesRateLimited) {
+		return true
+	}
+	var upstreamErr *llm.UpstreamError
+	return errors.As(err, &upstreamErr) && upstreamErr.StatusCode == 429
+}
+
+func MessageErrorCode(err error) string {
+	if IsUpstreamRateLimitError(err) {
+		return MessageErrorCodeUpstreamRateLimited
+	}
+	if errors.Is(err, ErrUpstreamEmptyResponse) {
+		return MessageErrorCodeUpstreamEmptyResponse
+	}
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, ErrGeneratedMediaArtifactUnavailable) {
+		return MessageErrorCodeMediaArtifactUnavailable
+	}
+	var upstreamErr *llm.UpstreamError
+	if errors.As(err, &upstreamErr) && isImageStreamConfigurationFailure(upstreamErr) {
+		return MessageErrorCodeMediaImageStreamUnsupported
+	}
+	return ""
+}
+
+// MessageErrorDebug 返回脱敏后的上游请求/响应快照，用于排查兼容性问题。
+func MessageErrorDebug(err error) *llm.UpstreamDebugSnapshot {
+	return messageErrorDebug(err)
+}
+
+func normalizeAttachmentKind(kind string, mimeType string) string {
+	value := strings.TrimSpace(kind)
+	if value != "" {
+		return value
+	}
+	return inferAttachmentKind(mimeType)
+}
+
+// NormalizeAttachmentKind 规范化附件类型，供边界层复用。
+func NormalizeAttachmentKind(kind string, mimeType string) string {
+	return normalizeAttachmentKind(kind, mimeType)
+}
+
+func normalizeToolType(raw string) string {
+	value := strings.ToLower(strings.TrimSpace(raw))
+	switch value {
+	case "function", "function_call", "tool_call":
+		return "function"
+	case "mcp", "mcp_call":
+		return "mcp"
+	case "":
+		return "function"
+	default:
+		return value
+	}
+}
+
+func inferAttachmentKind(mimeType string) string {
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(mimeType)), "image/") {
+		return "image"
+	}
+	return "file"
+}
+
+func normalizeBranchReason(raw string) string {
+	value := strings.ToLower(strings.TrimSpace(raw))
+	switch value {
+	case "retry", "edit":
+		return value
+	default:
+		return "default"
+	}
+}
+
+func normalizeMessageFeedback(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "up":
+		return "up"
+	case "down":
+		return "down"
+	default:
+		return ""
+	}
+}
+
+func fallbackContentType(contentType string) string {
+	value := strings.TrimSpace(contentType)
+	if value == "" {
+		return "text"
+	}
+	return value
+}
+
+func appendAssistantText(base string, suffix string) string {
+	if suffix == "" {
+		return base
+	}
+	if strings.TrimSpace(base) == "" {
+		return suffix
+	}
+	return base + "\n\n" + suffix
+}
+
+func shouldFallbackToNonStreaming(err error) bool {
+	var upstreamErr *llm.UpstreamError
+	if !errors.As(err, &upstreamErr) {
+		return false
+	}
+	switch upstreamErr.StatusCode {
+	case 405, 415, 501:
+		return true
+	default:
+		return isStreamUnsupportedError(upstreamErr)
+	}
+}
+
+// generationAttemptObservation 记录单次 LLM 生成尝试是否已向用户输出可见内容，
+// 用于区分"重试失败"与"已产生部分输出"（技能文件补充轮等场景）。
+type generationAttemptObservation struct {
+	emitted bool
+}
+
+func (o *generationAttemptObservation) markObservable() {
+	if o != nil {
+		o.emitted = true
+	}
+}
+
+func (o *generationAttemptObservation) canRetry(err error, classify func(error) bool) bool {
+	return o != nil && err != nil && !o.emitted && classify != nil && classify(err)
+}
+
+func isStreamUnsupportedError(err *llm.UpstreamError) bool {
+	detail := strings.ToLower(strings.TrimSpace(err.Message + " " + err.Body))
+	if detail == "" || !strings.Contains(detail, "stream") {
+		return false
+	}
+	for _, marker := range []string{
+		"not support",
+		"not_supported",
+		"unsupported",
+		"not available",
+		"does not support",
+		"doesn't support",
+	} {
+		if strings.Contains(detail, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func emitFallbackText(text string, onDelta func(string) error) error {
+	if onDelta == nil {
+		return nil
+	}
+	content := text
+	if content == "" {
+		return nil
+	}
+
+	runes := []rune(content)
+	const chunkSize = 24
+	for start := 0; start < len(runes); start += chunkSize {
+		end := start + chunkSize
+		if end > len(runes) {
+			end = len(runes)
+		}
+		if err := onDelta(string(runes[start:end])); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// isDocxMIME 判断文件是否为 DOCX 格式。
+func isDocxMIME(mimeType, fileName string) bool {
+	m := strings.ToLower(strings.TrimSpace(mimeType))
+	ext := ""
+	if idx := strings.LastIndex(fileName, "."); idx >= 0 {
+		ext = strings.ToLower(fileName[idx+1:])
+	}
+	return strings.Contains(m, "wordprocessingml") || strings.Contains(m, "msword") ||
+		ext == "docx" || ext == "doc"
+}
+
+func isPDFMIME(mimeType, fileName string) bool {
+	m := strings.ToLower(strings.TrimSpace(mimeType))
+	if m == "application/pdf" {
+		return true
+	}
+	if idx := strings.LastIndex(fileName, "."); idx >= 0 {
+		return strings.ToLower(fileName[idx+1:]) == "pdf"
+	}
+	return false
+}
+
+func isTextMIMEForEmbed(mimeType, fileName string) bool {
+	m := strings.ToLower(strings.TrimSpace(mimeType))
+	if strings.HasPrefix(m, "text/") {
+		return true
+	}
+	switch m {
+	case "application/json", "application/xml", "application/javascript", "application/typescript",
+		"application/yaml", "application/x-yaml", "application/toml":
+		return true
+	}
+	if idx := strings.LastIndex(fileName, "."); idx >= 0 {
+		ext := strings.ToLower(fileName[idx+1:])
+		switch ext {
+		case "txt", "md", "markdown", "csv", "json", "xml", "html", "htm",
+			"css", "js", "ts", "jsx", "tsx", "py", "go", "rs", "java",
+			"c", "cpp", "h", "hpp", "cs", "rb", "php", "swift", "kt",
+			"sh", "bash", "zsh", "yaml", "yml", "toml", "ini", "conf", "sql":
+			return true
+		}
+	}
+	return false
+}
+
+type userContextInput struct {
+	Attachments         []AttachmentInput
+	ImageAnalyses       []imageAttachmentAnalysis
+	RAGChunks           []domainconversation.RAGChunk
+	RAGNotice           string
+	HistoricalArtifacts []domainconversation.ContextArtifact
+	CurrentArtifacts    []domainconversation.ContextArtifact
+	Snapshot            *snapshotContext
+	Memory              []domainmemory.UserMemory
+	DocCards            []appdoccard.CardView
+	RecallChunks        []domainconversation.MessageChunk
+	// SupportsVision 主模型是否原生支持图片输入：
+	// false 时图片降级为路径标记（Hermes text 模式），不注入像素避免上游 400。
+	SupportsVision bool
+	// UserID 与 NonVisionExtractReader 供文本模型读取图片的 OCR/提取文本：
+	// 非 vision 模型看不到像素，hint 会附加提取出的文字内容（若已就绪）。
+	UserID                 uint
+	NonVisionExtractReader func(ctx context.Context, userID uint, fileID string) string
+}
+
+type snapshotContext struct {
+	Summary  string
+	FromTurn int
+	ToTurn   int
+	Strategy string
+}
+
+// prependStableFileContext 将可全文注入的文本文件固定放在消息前缀，避免多轮对话中
+// 同一份文件内容漂移到最新 user 消息，破坏上游前缀缓存。
+func prependStableFileContext(messages []llm.Message, attachments []AttachmentInput) []llm.Message {
+	contextXML := buildStableFileContextXML(attachments)
+	if contextXML.empty() {
+		return messages
+	}
+	content := buildUserContextPrompt("", contextXML)
+	if strings.TrimSpace(content) == "" {
+		return messages
+	}
+	result := make([]llm.Message, 0, len(messages)+1)
+	result = append(result, llm.Message{
+		Role:    "system",
+		Content: content,
+	})
+	result = append(result, messages...)
+	return result
+}
+
+func buildStableFileContextXML(attachments []AttachmentInput) userContextXML {
+	if len(attachments) == 0 {
+		return userContextXML{}
+	}
+	items := make([]AttachmentInput, 0, len(attachments))
+	for _, att := range attachments {
+		if !isStableTextAttachment(att) {
+			continue
+		}
+		items = append(items, att)
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		left := stableAttachmentSortKey(items[i])
+		right := stableAttachmentSortKey(items[j])
+		return left < right
+	})
+
+	contextXML := userContextXML{files: make([]string, 0, len(items))}
+	for _, att := range items {
+		contextXML.files = append(contextXML.files, formatAttachmentFileContext(att.FileName, att.ExtractedText))
+	}
+	return contextXML
+}
+
+func stableAttachmentSortKey(att AttachmentInput) string {
+	if value := strings.TrimSpace(att.FileID); value != "" {
+		return "0:" + value
+	}
+	if value := strings.TrimSpace(att.SHA256); value != "" {
+		return "1:" + value
+	}
+	if value := strings.TrimSpace(att.FileName); value != "" {
+		return "2:" + value
+	}
+	return "3:"
+}
+
+type conversationImageRef struct {
+	messageIndex int
+	fileID       string
+}
+
+func conversationImageRefs(messages []domainconversation.Message, attachments []AttachmentInput, limit int) []conversationImageRef {
+	if len(messages) == 0 || limit <= 0 {
+		return nil
+	}
+	available := make(map[string]AttachmentInput, len(attachments))
+	current := make(map[string]struct{})
+	for _, att := range attachments {
+		fileID := strings.TrimSpace(att.FileID)
+		if fileID == "" {
+			continue
+		}
+		if att.Current {
+			current[fileID] = struct{}{}
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(att.ContextMode), fileContextModeDirectImage) &&
+			normalizeAttachmentKind(att.Kind, firstNonEmptyString(att.DetectedMIME, att.MimeType)) == "image" {
+			available[fileID] = att
+		}
+	}
+
+	refs := make([]conversationImageRef, 0)
+	historyIndex := 0
+	for _, message := range messages {
+		if message.Role != "user" && message.Role != "assistant" && message.Role != "system" {
+			continue
+		}
+		if message.Role == "user" {
+			for _, snapshot := range parseAttachmentSnapshotRefs(message.Attachments) {
+				fileID := strings.TrimSpace(snapshot.FileID)
+				if fileID == "" {
+					continue
+				}
+				if _, isCurrent := current[fileID]; isCurrent {
+					continue
+				}
+				_, isAvailable := available[fileID]
+				snapshotMIME := firstNonEmptyString(snapshot.DetectedMIME, snapshot.MimeType)
+				if !isAvailable && normalizeAttachmentKind(snapshot.Kind, snapshotMIME) != "image" {
+					continue
+				}
+				refs = append(refs, conversationImageRef{messageIndex: historyIndex, fileID: fileID})
+			}
+		}
+		historyIndex++
+	}
+	if len(refs) > limit {
+		refs = refs[len(refs)-limit:]
+	}
+	return refs
+}
+
+// injectHistoricalImageHints 将历史图片引用降级为文本路径标记，按消息归组追加到对应
+// user 消息正文（非 vision 模型专用，避免上游对像素内容返回 400）。
+func injectHistoricalImageHints(messages []llm.Message, refs []conversationImageRef, attachments []AttachmentInput, historicalArtifacts []domainconversation.ContextArtifact) []llm.Message {
+	attachmentByFileID := make(map[string]AttachmentInput, len(attachments))
+	for _, att := range attachments {
+		attachmentByFileID[strings.TrimSpace(att.FileID)] = att
+	}
+	analysisByFileID := latestImageAnalysisByFileID(historicalArtifacts)
+	hintsByMessage := make(map[int][]string)
+	for _, ref := range refs {
+		att, ok := attachmentByFileID[ref.fileID]
+		if !ok {
+			continue
+		}
+		hint := buildImageAttachmentHint(att.FileName, att.FileID)
+		if analysis := strings.TrimSpace(analysisByFileID[ref.fileID]); analysis != "" {
+			hint += "\n[已有图片识别结果]：" + analysis
+		}
+		hint += "\n如需从新的角度核验或修正理解，可调用 system_multimodal_analyze，并传入该 fileID。"
+		hintsByMessage[ref.messageIndex] = append(hintsByMessage[ref.messageIndex], hint)
+	}
+	if len(hintsByMessage) == 0 {
+		return messages
+	}
+	result := cloneLLMMessages(messages)
+	for index, hints := range hintsByMessage {
+		if index < 0 || index >= len(result) {
+			continue
+		}
+		message := result[index]
+		content := strings.TrimSpace(userMessageText(message))
+		if content != "" {
+			content += "\n\n"
+		}
+		content += strings.Join(hints, "\n")
+		result[index] = llm.Message{Role: message.Role, Content: content}
+	}
+	return result
+}
+
+func latestImageAnalysisByFileID(artifacts []domainconversation.ContextArtifact) map[string]string {
+	result := make(map[string]string)
+	for _, item := range artifacts {
+		if item.Kind != domainconversation.ContextArtifactImageAnalysis {
+			continue
+		}
+		fileID := imageArtifactFileID(item)
+		content := strings.TrimSpace(item.Content)
+		if fileID == "" || content == "" {
+			continue
+		}
+		if _, exists := result[fileID]; exists {
+			continue
+		}
+		result[fileID] = content
+	}
+	return result
+}
+
+func (s *Service) injectConversationImageContext(
+	ctx context.Context,
+	messages []llm.Message,
+	domainMessages []domainconversation.Message,
+	attachments []AttachmentInput,
+	cfg config.Config,
+	supportsVision bool,
+	historicalArtifacts ...[]domainconversation.ContextArtifact,
+) ([]llm.Message, error) {
+	var artifacts []domainconversation.ContextArtifact
+	if len(historicalArtifacts) > 0 {
+		artifacts = historicalArtifacts[0]
+	}
+	refs := conversationImageRefs(domainMessages, attachments, maxConversationImageContextCount)
+	if len(refs) == 0 {
+		return messages, nil
+	}
+
+	// 非 vision 模型：历史图片同样不注入像素，降级为路径标记（Hermes text 模式），
+	// 附加到对应历史用户消息正文，模型知道历史里存在哪些图（含 fileID 供工具引用）。
+	if !supportsVision {
+		return injectHistoricalImageHints(messages, refs, attachments, artifacts), nil
+	}
+
+	attachmentByFileID := make(map[string]AttachmentInput, len(attachments))
+	for _, att := range attachments {
+		attachmentByFileID[strings.TrimSpace(att.FileID)] = att
+	}
+	maxDim := cfg.ImageMaxDimension
+	if maxDim <= 0 {
+		maxDim = 1024
+	}
+	cache := s.imageContextCache
+	if cache == nil {
+		cache = defaultPreparedConversationImageCache()
+	}
+	storeProvider := s.storeProvider
+	if storeProvider == nil {
+		storeProvider = appstorage.NewRuntimeProvider(config.NewRuntime(cfg), nil)
+	}
+
+	var store objectstore.Store
+	partsByRef := make(map[int]llm.ContentPart, len(refs))
+	loadedByFileID := make(map[string]llm.ContentPart, len(refs))
+	totalBytes := 0
+	for index := len(refs) - 1; index >= 0; index-- {
+		ref := refs[index]
+		part, loaded := loadedByFileID[ref.fileID]
+		if !loaded {
+			att, ok := attachmentByFileID[ref.fileID]
+			if !ok || strings.TrimSpace(att.StoragePath) == "" {
+				return nil, fmt.Errorf("%w: historical image %s", ErrInvalidFileReference, ref.fileID)
+			}
+			mime := resolveImageMimeType(firstNonEmptyString(att.DetectedMIME, att.MimeType))
+			cacheKey := preparedConversationImageCacheKey(att, maxDim, mime)
+			if cached, ok := cache.get(cacheKey); ok {
+				part = llm.ContentPart{Kind: llm.ContentPartImage, MimeType: cached.mimeType, Data: cached.data}
+			} else {
+				if store == nil {
+					openedStore, openErr := storeProvider.Open(ctx)
+					if openErr != nil {
+						return nil, fmt.Errorf("%w: open object storage: %w", ErrFileNotFound, openErr)
+					}
+					store = openedStore
+				}
+				reader, _, openErr := store.Open(ctx, strings.TrimSpace(att.StoragePath))
+				if openErr != nil {
+					return nil, fmt.Errorf("%w: historical image %s: %v", ErrFileNotFound, ref.fileID, openErr)
+				}
+				data, readErr := io.ReadAll(io.LimitReader(reader, maxConversationImageSourceBytes+1))
+				closeErr := reader.Close()
+				if readErr != nil {
+					return nil, fmt.Errorf("%w: read historical image %s: %v", ErrFileNotFound, ref.fileID, readErr)
+				}
+				if closeErr != nil {
+					return nil, fmt.Errorf("%w: close historical image %s: %v", ErrFileNotFound, ref.fileID, closeErr)
+				}
+				if len(data) == 0 {
+					return nil, fmt.Errorf("%w: historical image %s is empty", ErrInvalidFileReference, ref.fileID)
+				}
+				if len(data) > maxConversationImageSourceBytes {
+					return nil, fmt.Errorf("%w: historical image %s exceeds source limit", ErrFileTooLarge, ref.fileID)
+				}
+				resized, actualMIME := resizeImageIfNeeded(data, mime, maxDim)
+				part = llm.ContentPart{Kind: llm.ContentPartImage, MimeType: actualMIME, Data: resized}
+				cache.put(cacheKey, preparedConversationImage{data: resized, mimeType: actualMIME})
+			}
+			loadedByFileID[ref.fileID] = part
+		}
+		if len(part.Data) == 0 {
+			return nil, fmt.Errorf("%w: historical image %s is empty", ErrInvalidFileReference, ref.fileID)
+		}
+		if totalBytes+len(part.Data) > maxConversationImageContextBytes {
+			return nil, fmt.Errorf("%w: historical image context exceeds %d bytes", ErrFileTooLarge, maxConversationImageContextBytes)
+		}
+		totalBytes += len(part.Data)
+		partsByRef[index] = part
+	}
+
+	result := cloneLLMMessages(messages)
+	for index, ref := range refs {
+		part := partsByRef[index]
+		if ref.messageIndex < 0 || ref.messageIndex >= len(result) {
+			return nil, fmt.Errorf("%w: historical image message index", ErrInvalidFileReference)
+		}
+		message := result[ref.messageIndex]
+		message.Parts = append([]llm.ContentPart(nil), message.Parts...)
+		if len(message.Parts) == 0 && strings.TrimSpace(message.Content) != "" {
+			message.Parts = append(message.Parts, llm.ContentPart{Kind: llm.ContentPartText, Text: message.Content})
+			message.Content = ""
+		}
+		message.Parts = append(message.Parts, part)
+		result[ref.messageIndex] = message
+	}
+	return result, nil
+}
+
+func imageAttachmentsForCurrentUser(attachments []AttachmentInput) []AttachmentInput {
+	if len(attachments) == 0 {
+		return nil
+	}
+	result := make([]AttachmentInput, 0)
+	for _, att := range attachments {
+		if att.Current && normalizeAttachmentKind(att.Kind, att.MimeType) == "image" {
+			result = append(result, att)
+		}
+	}
+	return result
+}
+
+func injectUserContext(
+	ctx context.Context,
+	messages []llm.Message,
+	input userContextInput,
+	cfg config.Config,
+	storeProvider appstorage.Provider,
+) []llm.Message {
+	if len(input.Attachments) == 0 &&
+		len(input.ImageAnalyses) == 0 &&
+		len(input.RAGChunks) == 0 &&
+		strings.TrimSpace(input.RAGNotice) == "" &&
+		len(input.HistoricalArtifacts) == 0 &&
+		input.Snapshot == nil &&
+		len(input.Memory) == 0 &&
+		len(input.DocCards) == 0 &&
+		len(input.RecallChunks) == 0 {
+		return messages
+	}
+
+	maxDim := cfg.ImageMaxDimension
+	if maxDim <= 0 {
+		maxDim = 1024
+	}
+
+	// 找到最后一条用户消息，构建 ContentParts
+	lastUserIdx := -1
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" {
+			lastUserIdx = i
+			break
+		}
+	}
+	if lastUserIdx < 0 {
+		return messages
+	}
+
+	lastUserMsg := messages[lastUserIdx]
+	imageParts := make([]llm.ContentPart, 0, len(lastUserMsg.Parts)+len(input.Attachments))
+	for _, part := range lastUserMsg.Parts {
+		if part.Kind == llm.ContentPartImage && len(part.Data) > 0 {
+			imageParts = append(imageParts, part)
+		}
+	}
+	contextXML := buildUserContextXML(input)
+	// 非 vision 模型：图片不注入像素，降级为路径标记（Hermes text 模式），
+	// 模型知道有图（含 fileID 供工具引用）但不会触发上游 400。
+	imageHints := make([]string, 0)
+
+	for _, att := range input.Attachments {
+		kind := normalizeAttachmentKind(att.Kind, att.MimeType)
+		if kind == "image" {
+			if !input.SupportsVision {
+				hint := buildImageAttachmentHint(att.FileName, att.FileID)
+				if input.NonVisionExtractReader != nil {
+					if text := input.NonVisionExtractReader(ctx, input.UserID, att.FileID); text != "" {
+						hint += "\n[图片内容文字识别]：" + text
+					} else {
+						hint += "\n（图片文字尚未提取；如需其中的文字，请直接请求用户提供）"
+					}
+				}
+				imageHints = append(imageHints, hint)
+				continue
+			}
+			// 图片：读取文件字节并缩放
+			storagePath := strings.TrimSpace(att.StoragePath)
+			if storagePath == "" {
+				continue
+			}
+			if storeProvider == nil {
+				storeProvider = appstorage.NewRuntimeProvider(config.NewRuntime(cfg), nil)
+			}
+			store, storeErr := storeProvider.Open(ctx)
+			if storeErr != nil {
+				continue
+			}
+			reader, _, readErr := store.Open(ctx, storagePath)
+			if readErr != nil {
+				continue
+			}
+			imgData, readErr := io.ReadAll(io.LimitReader(reader, 50*1024*1024))
+			_ = reader.Close()
+			if readErr != nil {
+				continue
+			}
+			mime := resolveImageMimeType(att.MimeType)
+			resized, actualMIME := resizeImageIfNeeded(imgData, mime, maxDim)
+			imageParts = append(imageParts, llm.ContentPart{
+				Kind:     llm.ContentPartImage,
+				MimeType: actualMIME,
+				Data:     resized,
+			})
+		}
+	}
+
+	if len(imageParts) == 0 && len(imageHints) == 0 && contextXML.empty() {
+		return messages
+	}
+
+	content := strings.TrimSpace(userMessageText(lastUserMsg))
+	if !contextXML.empty() {
+		content = buildUserContextPrompt(content, contextXML)
+	}
+
+	if len(imageHints) > 0 {
+		// 非 vision：hint 文本并入用户消息正文（无像素注入）。
+		if content != "" {
+			content += "\n\n"
+		}
+		content += strings.Join(imageHints, "\n")
+	}
+
+	result := make([]llm.Message, len(messages))
+	copy(result, messages)
+	if len(imageParts) == 0 {
+		result[lastUserIdx] = llm.Message{
+			Role:    lastUserMsg.Role,
+			Content: content,
+		}
+		return result
+	}
+
+	parts := make([]llm.ContentPart, 0, 1+len(imageParts))
+	if content != "" {
+		parts = append(parts, llm.ContentPart{
+			Kind: llm.ContentPartText,
+			Text: content,
+		})
+	}
+	parts = append(parts, imageParts...)
+	result[lastUserIdx] = llm.Message{Role: lastUserMsg.Role, Parts: parts}
+	return result
+}
+
+func userMessageText(message llm.Message) string {
+	if strings.TrimSpace(message.Content) != "" || len(message.Parts) == 0 {
+		return message.Content
+	}
+	var builder strings.Builder
+	for _, part := range message.Parts {
+		if part.Kind != llm.ContentPartText && part.Kind != llm.ContentPartFile {
+			continue
+		}
+		if builder.Len() > 0 {
+			builder.WriteString("\n")
+		}
+		builder.WriteString(part.Text)
+	}
+	return builder.String()
+}
+
+func formatAttachmentFileContext(fileName string, text string) string {
+	name := strings.TrimSpace(fileName)
+	if name == "" {
+		name = "未命名文件"
+	}
+	return `<file name="` + xmlEscapeAttr(name) + `">` + xmlEscapeText(strings.TrimSpace(text)) + `</file>`
+}
+
+type userContextXML struct {
+	summary   string
+	memory    []string
+	cards     string
+	files     []string
+	images    []string
+	evidence  []string
+	rag       []string
+	ragNotice string
+	recall    []string
+}
+
+func (x userContextXML) empty() bool {
+	return strings.TrimSpace(x.summary) == "" &&
+		len(x.memory) == 0 &&
+		strings.TrimSpace(x.cards) == "" &&
+		len(x.files) == 0 &&
+		len(x.images) == 0 &&
+		len(x.evidence) == 0 &&
+		len(x.rag) == 0 &&
+		strings.TrimSpace(x.ragNotice) == "" &&
+		len(x.recall) == 0
+}
+
+func buildUserContextXML(input userContextInput) userContextXML {
+	return userContextXML{
+		summary:   formatSnapshotContext(input.Snapshot),
+		memory:    formatMemoryContext(input.Memory),
+		cards:     formatDocCardsContext(input.DocCards, docCardContentLimit),
+		images:    formatImageAnalysisContext(input.ImageAnalyses),
+		evidence:  formatHistoricalEvidenceContext(input.HistoricalArtifacts),
+		rag:       formatRAGFileContext(input.RAGChunks),
+		ragNotice: strings.TrimSpace(input.RAGNotice),
+		recall:    formatRecallContext(input.RecallChunks),
+	}
+}
+
+func formatImageAnalysisContext(analyses []imageAttachmentAnalysis) []string {
+	if len(analyses) == 0 {
+		return nil
+	}
+	items := make([]string, 0, len(analyses))
+	for _, analysis := range analyses {
+		content := strings.TrimSpace(analysis.Content)
+		if content == "" {
+			continue
+		}
+		name := firstNonEmptyString(analysis.FileName, analysis.FileID, "unknown")
+		toolName := firstNonEmptyString(analysis.ToolName, "MCP")
+		kind := firstNonEmptyString(analysis.Kind, "image")
+		items = append(items, `<media kind="`+xmlEscapeAttr(kind)+`" name="`+xmlEscapeAttr(name)+`" via="`+xmlEscapeAttr(toolName)+`">`+xmlEscapeText(content)+`</media>`)
+	}
+	return items
+}
+
+func formatSnapshotContext(snapshot *snapshotContext) string {
+	if snapshot == nil || strings.TrimSpace(snapshot.Summary) == "" {
+		return ""
+	}
+	attrs := ` from="` + xmlEscapeAttr(fmt.Sprintf("%d", snapshot.FromTurn)) + `" to="` + xmlEscapeAttr(fmt.Sprintf("%d", snapshot.ToTurn)) + `"`
+	if strategy := strings.TrimSpace(snapshot.Strategy); strategy != "" {
+		attrs += ` strategy="` + xmlEscapeAttr(strategy) + `"`
+	}
+	return "<sum" + attrs + ">" + xmlEscapeText(strings.TrimSpace(snapshot.Summary)) + "</sum>"
+}
+
+func formatMemoryContext(memories []domainmemory.UserMemory) []string {
+	if len(memories) == 0 {
+		return nil
+	}
+	items := make([]string, 0, len(memories))
+	var usedTokens int64
+	for _, memory := range memories {
+		key := strings.TrimSpace(memory.MemoryKey)
+		value := strings.TrimSpace(memory.Value)
+		if key == "" || value == "" {
+			continue
+		}
+		remainingTokens := userMemoryContextMaxTokens - usedTokens
+		if remainingTokens <= 0 {
+			break
+		}
+		prefix := `<mem k="` + xmlEscapeAttr(key) + `">`
+		suffix := `</mem>`
+		overheadTokens := estimateTokens(prefix + suffix)
+		if overheadTokens >= remainingTokens {
+			break
+		}
+		escapedValue := fitXMLTextToTokenBudget(value, remainingTokens-overheadTokens)
+		if escapedValue == "" {
+			break
+		}
+		item := prefix + escapedValue + suffix
+		itemTokens := estimateTokens(item)
+		if itemTokens > remainingTokens {
+			break
+		}
+		items = append(items, item)
+		usedTokens += itemTokens
+	}
+	return items
+}
+
+func formatRAGFileContext(chunks []domainconversation.RAGChunk) []string {
+	if len(chunks) == 0 {
+		return nil
+	}
+	items := make([]string, 0, len(chunks))
+	for index, chunk := range chunks {
+		text := strings.TrimSpace(chunk.Content)
+		if text == "" {
+			continue
+		}
+		name := strings.TrimSpace(chunk.FileName)
+		if name == "" {
+			name = strings.TrimSpace(chunk.FileID)
+		}
+		if name == "" {
+			name = "unknown"
+		}
+		chunkIndex := chunk.ChunkIndex
+		if chunkIndex <= 0 {
+			chunkIndex = index + 1
+		}
+		attrs := `name="` + xmlEscapeAttr(name) + `" i="` + xmlEscapeAttr(fmt.Sprintf("%d", chunkIndex)) + `"`
+		if chunk.Modality == domainconversation.FileChunkModalityImage {
+			// 图片分片的文本来自 OCR；原图已作为附件随消息发送。
+			attrs += ` kind="image"`
+		}
+		items = append(items, `<doc `+attrs+`>`+xmlEscapeText(text)+`</doc>`)
+	}
+	return items
+}
+
+func formatHistoricalEvidenceContext(artifacts []domainconversation.ContextArtifact) []string {
+	if len(artifacts) == 0 {
+		return nil
+	}
+	items := make([]string, 0, len(artifacts))
+	for _, artifact := range artifacts {
+		content := strings.TrimSpace(artifact.Content)
+		if content == "" {
+			continue
+		}
+		kind := strings.TrimSpace(string(artifact.Kind))
+		if kind == "" {
+			kind = "evidence"
+		}
+		source := strings.TrimSpace(artifact.SourceTitle)
+		if source == "" {
+			source = strings.TrimSpace(artifact.SourceID)
+		}
+		if source == "" {
+			source = "unknown"
+		}
+		items = append(items, `<ev k="`+xmlEscapeAttr(kind)+`" src="`+xmlEscapeAttr(source)+`">`+xmlEscapeText(compactSnippet(content, 500))+`</ev>`)
+	}
+	return items
+}
+
+func formatRecallContext(chunks []domainconversation.MessageChunk) []string {
+	if len(chunks) == 0 {
+		return nil
+	}
+	items := make([]string, 0, len(chunks))
+	for index, chunk := range chunks {
+		content := strings.TrimSpace(chunk.Content)
+		if content == "" {
+			continue
+		}
+		role := strings.TrimSpace(chunk.Role)
+		if role == "" {
+			role = "unknown"
+		}
+		chunkIndex := chunk.ChunkIndex
+		if chunkIndex <= 0 {
+			chunkIndex = index + 1
+		}
+		items = append(items, `<msg role="`+xmlEscapeAttr(role)+`" i="`+xmlEscapeAttr(fmt.Sprintf("%d", chunkIndex))+`">`+xmlEscapeText(compactSnippet(content, 300))+`</msg>`)
+	}
+	return items
+}
+
+func buildUserContextPrompt(userRequest string, contextXML userContextXML) string {
+	var builder strings.Builder
+	builder.WriteString("<ctx>")
+	if strings.TrimSpace(contextXML.summary) != "" {
+		builder.WriteString("\n")
+		builder.WriteString(contextXML.summary)
+	}
+	if len(contextXML.memory) > 0 {
+		builder.WriteString("\n<mems>\n")
+		builder.WriteString(strings.Join(contextXML.memory, "\n"))
+		builder.WriteString("\n</mems>")
+	}
+	if strings.TrimSpace(contextXML.cards) != "" {
+		builder.WriteString(contextXML.cards)
+	}
+	if len(contextXML.files) > 0 {
+		builder.WriteString("\n<files>\n")
+		builder.WriteString(strings.Join(contextXML.files, "\n"))
+		builder.WriteString("\n</files>")
+	}
+	if len(contextXML.images) > 0 {
+		builder.WriteString("\n<images>\n")
+		builder.WriteString(strings.Join(contextXML.images, "\n"))
+		builder.WriteString("\n</images>")
+	}
+	if len(contextXML.evidence) > 0 {
+		builder.WriteString("\n<evs>\n")
+		builder.WriteString(strings.Join(contextXML.evidence, "\n"))
+		builder.WriteString("\n</evs>")
+	}
+	if len(contextXML.rag) > 0 {
+		builder.WriteString("\n<rag>\n")
+		builder.WriteString(strings.Join(contextXML.rag, "\n"))
+		builder.WriteString("\n</rag>")
+	}
+	if strings.TrimSpace(contextXML.ragNotice) != "" {
+		builder.WriteString("\n<rag_status>")
+		builder.WriteString(xmlEscapeText(contextXML.ragNotice))
+		builder.WriteString("</rag_status>")
+	}
+	if len(contextXML.recall) > 0 {
+		builder.WriteString("\n<recall>\n")
+		builder.WriteString(strings.Join(contextXML.recall, "\n"))
+		builder.WriteString("\n</recall>")
+	}
+	builder.WriteString("\n</ctx>")
+
+	request := strings.TrimSpace(userRequest)
+	if request != "" {
+		builder.WriteString("\n\n<q>")
+		builder.WriteString(xmlEscapeText(request))
+		builder.WriteString("</q>")
+	}
+	return builder.String()
+}
+
+var xmlTextReplacer = strings.NewReplacer(
+	"&", "&amp;",
+	"<", "&lt;",
+	">", "&gt;",
+)
+
+func xmlEscapeAttr(value string) string {
+	var builder strings.Builder
+	if err := xml.EscapeText(&builder, []byte(value)); err != nil {
+		return ""
+	}
+	return builder.String()
+}
+
+func xmlEscapeText(value string) string {
+	return xmlTextReplacer.Replace(value)
+}
+
+func fitXMLTextToTokenBudget(value string, maxTokens int64) string {
+	if maxTokens <= 0 {
+		return ""
+	}
+	escaped := xmlEscapeText(value)
+	if estimateTokens(escaped) <= maxTokens {
+		return escaped
+	}
+	const truncationSuffix = "…"
+	if estimateTokens(truncationSuffix) > maxTokens {
+		return ""
+	}
+	runes := []rune(value)
+	low, high := 0, len(runes)
+	for low < high {
+		mid := (low + high + 1) / 2
+		candidate := xmlEscapeText(string(runes[:mid])) + truncationSuffix
+		if estimateTokens(candidate) <= maxTokens {
+			low = mid
+		} else {
+			high = mid - 1
+		}
+	}
+	return xmlEscapeText(string(runes[:low])) + truncationSuffix
+}
+
+// filterMemoriesByScope 按 scope 过滤记忆列表。
+func filterMemoriesByScope(memories []domainmemory.UserMemory, scopes ...string) []domainmemory.UserMemory {
+	scopeSet := make(map[string]struct{}, len(scopes))
+	for _, s := range scopes {
+		scopeSet[domainmemory.NormalizeCategory(s)] = struct{}{}
+	}
+	result := make([]domainmemory.UserMemory, 0, len(memories))
+	for _, m := range memories {
+		m.Scope = domainmemory.NormalizeCategory(m.Scope)
+		if _, ok := scopeSet[m.Scope]; ok {
+			result = append(result, m)
+		}
+	}
+	return result
+}
+
+// selectRelevantMemories 从记忆列表中按关键词相关性选出最多 topK 条。
+// 无向量服务时使用关键词匹配作为后备策略：key 或 value 命中查询词即认为相关。
+func selectRelevantMemories(memories []domainmemory.UserMemory, query string, topK int) []domainmemory.UserMemory {
+	if len(memories) == 0 || topK <= 0 {
+		return nil
+	}
+
+	// 查询词命中的记忆优先注入上下文，降低无关长期记忆对回答的干扰。
+	queryLower := strings.ToLower(strings.TrimSpace(query))
+	words := strings.Fields(queryLower)
+	if queryLower == "" || len(words) == 0 {
+		return nil
+	}
+
+	type scored struct {
+		m     domainmemory.UserMemory
+		score int
+	}
+	items := make([]scored, 0, len(memories))
+	for _, m := range memories {
+		combined := strings.ToLower(m.MemoryKey + " " + m.Value)
+		score := 0
+		for _, w := range words {
+			if len(w) >= 2 && strings.Contains(combined, w) {
+				score++
+			}
+		}
+		if score > 0 {
+			items = append(items, scored{m, score})
+		}
+	}
+
+	// 按分数降序，保持同分时原始顺序（stable）
+	for i := 1; i < len(items); i++ {
+		for j := i; j > 0 && items[j].score > items[j-1].score; j-- {
+			items[j], items[j-1] = items[j-1], items[j]
+		}
+	}
+
+	result := make([]domainmemory.UserMemory, 0, topK)
+	for i := 0; i < topK && i < len(items); i++ {
+		result = append(result, items[i].m)
+	}
+	return result
+}
+
+// selectRelevantUserMemories 优先使用记忆向量检索；不可用或超时后回退到关键词筛选。
+func (s *Service) selectRelevantUserMemories(ctx context.Context, userID uint, query string, memories []domainmemory.UserMemory, topK int) []domainmemory.UserMemory {
+	fallback := selectRelevantMemories(memories, query, topK)
+	if s == nil || s.embeddingSvc == nil || s.memoryRecorder == nil || strings.TrimSpace(query) == "" {
+		return fallback
+	}
+	cfg := s.cfg.Snapshot()
+	if !cfg.EmbeddingEnabled {
+		return fallback
+	}
+	searchCtx, cancel := context.WithTimeout(ctx, userMemoryRecallDeadline)
+	defer cancel()
+	embeddings, embeddingSignature, err := s.embeddingSvc.EmbedQueriesWithSignature(searchCtx, []string{query})
+	if err != nil || len(embeddings) == 0 {
+		return fallback
+	}
+	matches, err := s.memoryRecorder.SearchUserMemoriesByEmbedding(searchCtx, userID, embeddings[0], embeddingSignature, topK, 0.7)
+	if err != nil || len(matches) == 0 {
+		return fallback
+	}
+
+	allowed := make(map[string]domainmemory.UserMemory, len(memories))
+	for _, memory := range memories {
+		key := strings.TrimSpace(memory.MemoryKey)
+		if key == "" {
+			continue
+		}
+		allowed[key] = memory
+	}
+	result := make([]domainmemory.UserMemory, 0, topK)
+	seen := make(map[string]struct{}, topK)
+	for _, memory := range matches {
+		key := strings.TrimSpace(memory.MemoryKey)
+		item, ok := allowed[key]
+		if !ok {
+			continue
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		result = append(result, item)
+		seen[key] = struct{}{}
+		if len(result) >= topK {
+			break
+		}
+	}
+	if len(result) == 0 {
+		return fallback
+	}
+	return result
+}
+
+// buildPreferencePrompt 将 scope=preference 的记忆格式化为行为指令型 system 提示。
+func buildPreferencePrompt(memories []domainmemory.UserMemory, maxTokens int) string {
+	if len(memories) == 0 || maxTokens <= 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("# prefs\n")
+	for _, m := range memories {
+		line := "- " + strings.TrimSpace(m.MemoryKey) + ": " + strings.TrimSpace(m.Value) + "\n"
+		sb.WriteString(line)
+	}
+	return truncateByEstimatedTokens(strings.TrimRight(sb.String(), "\n"), int64(maxTokens))
+}
+
+// buildMemorySystemPrompt injects preferences and only advertises on-demand categories.
+func buildMemorySystemPrompt(memories []domainmemory.UserMemory, maxPreferenceTokens int) string {
+	sections := make([]string, 0, 2)
+	if preferences := buildPreferencePrompt(filterMemoriesByScope(memories, domainmemory.CategoryPreference), maxPreferenceTokens); preferences != "" {
+		sections = append(sections, preferences)
+	}
+	counts := make([]string, 0, 3)
+	for _, category := range []string{domainmemory.CategoryIdentity, domainmemory.CategoryActivity, domainmemory.CategoryContext} {
+		if count := len(filterMemoriesByScope(memories, category)); count > 0 {
+			counts = append(counts, fmt.Sprintf("%s=%d", category, count))
+		}
+	}
+	if len(counts) > 0 {
+		sections = append(sections, "# memory_catalog\nAdditional long-term memories are available but not loaded ("+strings.Join(counts, ", ")+"). If list_memories is available, read only the category relevant to the current request; do not assume these memories apply before reading them.")
+	}
+	return strings.Join(sections, "\n\n")
+}
+
+// nonVisionImageExtractText 读取图片文件的 OCR/提取文本，供文本模型（无 vision）
+// "阅读"图片内容。提取未就绪、缺失或读取失败时静默返回空串，不改变既有降级提示。
+func (s *Service) nonVisionImageExtractText(ctx context.Context, userID uint, fileID string) string {
+	if s == nil || s.repo == nil || s.extractSvc == nil || strings.TrimSpace(fileID) == "" {
+		return ""
+	}
+	fileObj, err := s.repo.GetActiveFileObjectByID(ctx, userID, strings.TrimSpace(fileID))
+	if err != nil || fileObj == nil || strings.TrimSpace(fileObj.ExtractStatus) != "ready" {
+		return ""
+	}
+	result, err := s.repo.GetFileObjectProcessingByObjectID(ctx, fileObj.ID)
+	if err != nil || result == nil || strings.TrimSpace(result.ExtractStoragePath) == "" {
+		return ""
+	}
+	text, err := s.extractSvc.ReadExtractedText(ctx, result.ExtractStoragePath)
+	if err != nil {
+		return ""
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	const maxNonVisionImageHintChars = 1500
+	if len(text) > maxNonVisionImageHintChars {
+		text = text[:maxNonVisionImageHintChars] + "…"
+	}
+	return text
+}
+

@@ -1,0 +1,40 @@
+name: deeix-chat
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # 生产必须由 docker-compose.override.yml pin 精确 tag（发布流程见 docs/CUSTOM_DEPLOYMENT.md §2/§4），
+    # 此默认值仅用于本地构建；绝不默认拉取上游 ghcr.io/deeix-ai/deeix-chat:latest。
+    image: ${DEEIX_CHAT_IMAGE:-deeix-chat:local}
+    container_name: deeix-chat-app
+    ports:
+      # Optional. Localhost-only by default. Put a reverse proxy in front for public access.
+      - "127.0.0.1:8080:8080"
+    environment:
+      # Optional. Sandbox MCP 集成（配套 /opt/deeix-mcp 栈，见 tools/sandbox-mcp/deploy）。
+      # SANDBOX_META_HMAC_KEY 必须与沙箱栈 SANDBOX_META_HMAC_KEY 一致（_meta 身份签名）。
+      SANDBOX_META_HMAC_KEY: ${SANDBOX_META_HMAC_KEY:-}
+      SANDBOX_SHARED_DIR: ${SANDBOX_SHARED_DIR:-/shared}
+      SANDBOX_IMPORTS_DIR: ${SANDBOX_IMPORTS_DIR:-/imports}
+    volumes:
+      - app_storage:/app/storage
+      - ${SANDBOX_SHARED_HOST_DIR:-/opt/deeix-mcp/shared}:/shared:ro   # 沙箱/多模态 MCP 共享目录（只读，供 __export__ 导出文件）
+      - ${SANDBOX_IMPORTS_HOST_DIR:-/opt/deeix-mcp/imports}:/imports:rw # 当前消息附件按 user/conversation scope 同步
+      - app_data:/app/data
+      # The image runs from /app and reads /app/config.yaml automatically.
+      - ./config.yaml:/app/config.yaml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - deeix-chat
+volumes:
+  app_storage:
+    name: deeix-chat-app-storage
+  app_data:
+    name: deeix-chat-app-data
+
+networks:
+  deeix-chat:
+    name: deeix-chat-network

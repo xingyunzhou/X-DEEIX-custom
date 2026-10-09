@@ -1,0 +1,2239 @@
+package conversation
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/DEEIX-AI/DEEIX-Chat/backend/internal/application/channel"
+	appcompact "github.com/DEEIX-AI/DEEIX-Chat/backend/internal/application/compact"
+	appcm "github.com/DEEIX-AI/DEEIX-Chat/backend/internal/application/contentmoderation"
+	appdoccard "github.com/DEEIX-AI/DEEIX-Chat/backend/internal/application/doccard"
+	apprag "github.com/DEEIX-AI/DEEIX-Chat/backend/internal/application/rag"
+	model "github.com/DEEIX-AI/DEEIX-Chat/backend/internal/domain/conversation"
+	domainmemory "github.com/DEEIX-AI/DEEIX-Chat/backend/internal/domain/memory"
+	"github.com/DEEIX-AI/DEEIX-Chat/backend/internal/ports/llm"
+	platformtracing "github.com/DEEIX-AI/DEEIX-Chat/backend/internal/infra/observability/tracing"
+	"github.com/DEEIX-AI/DEEIX-Chat/backend/internal/pkg/textutil"
+	"github.com/DEEIX-AI/DEEIX-Chat/backend/internal/pkg/traceid"
+	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/zap"
+)
+
+var conversationReferencePattern = regexp.MustCompile(`\[会话引用:\s*.*?\(([A-Za-z0-9_-]{4,128})\)\]`)
+
+// resolveConversationReferences expands drag-and-dropped conversation IDs into a bounded prompt block.
+func (s *Service) resolveConversationReferences(ctx context.Context, userID uint, content string) []model.Message {
+	matches := conversationReferencePattern.FindAllStringSubmatch(content, 4)
+	if len(matches) == 0 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	var out []model.Message
+	for _, match := range matches {
+		publicID := strings.TrimSpace(match[1])
+		if _, ok := seen[publicID]; ok {
+			continue
+		}
+		seen[publicID] = struct{}{}
+		conversation, err := s.repo.GetConversationByPublicID(ctx, publicID, userID)
+		if err != nil {
+			continue
+		}
+		messages, _, err := s.repo.ListMessages(ctx, conversation.ID, 0, 20)
+		if err != nil {
+			continue
+		}
+		for _, message := range messages {
+			if strings.TrimSpace(message.Content) == "" || (message.Role != "user" && message.Role != "assistant") {
+				continue
+			}
+			message.Content = "[引用会话 " + publicID + "]\n" + message.Content
+			out = append(out, message)
+		}
+	}
+	return out
+}
+
+const (
+	reasoningContentPassbackSettingKey = "chat.reasoning_content_passback"
+	maxRequestRouteAttempts            = 3
+)
+
+// SendMessage 发送消息并调用上游渠道对话接口，支持多模态附件。
+func (s *Service) SendMessage(ctx context.Context, input SendMessageInput) (result *SendMessageResult, retErr error) {
+	return s.sendMessageInternal(ctx, input, nil, false)
+}
+
+// StreamMessage 发送消息并按增量回调返回 assistant 文本。
+// onDelta 接收流式文本增量；input.OnEvent 接收中间事件（如 rag_search）。
+func (s *Service) StreamMessage(
+	ctx context.Context,
+	input SendMessageInput,
+	onDelta func(string) error,
+) (result *SendMessageResult, retErr error) {
+	input.Cancelable = true
+	return s.sendMessageInternal(ctx, input, onDelta, true)
+}
+
+func (s *Service) reasoningContentPassbackEnabled(ctx context.Context, userID uint, route *channel.ResolvedRoute) bool {
+	if route == nil || !route.ReasoningContentPassback {
+		return false
+	}
+	value, err := s.getUserSettingCached(ctx, userID, reasoningContentPassbackSettingKey)
+	return err == nil && value != "false"
+}
+
+func messageRouteConfig(route *channel.ResolvedRoute, attributionReferer string, attributionTitle string) llm.RouteConfig {
+	return llm.RouteConfig{
+		Protocol:            route.Protocol,
+		BaseURL:             route.BaseURL,
+		APIKey:              route.APIKey,
+		HeadersJSON:         route.HeadersJSON,
+		ConnectTimeoutMS:    route.ConnectTimeoutMS,
+		ReadTimeoutMS:       route.ReadTimeoutMS,
+		StreamIdleTimeoutMS: route.StreamIdleTimeoutMS,
+		Endpoint:            llm.DefaultEndpointForAdapter(route.Protocol),
+		UpstreamModel:       route.UpstreamModel,
+		AttributionReferer:  attributionReferer,
+		AttributionTitle:    attributionTitle,
+	}
+}
+
+func canFailoverMessageRoute(attemptCount int, llmRequestCount int, maxLLMCalls int, visibleDeltaCount int, attemptHadSideEffect bool, cause error) bool {
+	return cause != nil &&
+		attemptCount < maxRequestRouteAttempts &&
+		llmRequestCount < maxLLMCalls &&
+		visibleDeltaCount == 0 &&
+		!attemptHadSideEffect &&
+		channel.ShouldFailoverRoute(cause)
+}
+
+// emitEvent 统一处理可选事件回调，调用方无需重复判断 nil。
+func emitEvent(onEvent func(string, map[string]interface{}) error, eventType string, payload map[string]interface{}) {
+	if onEvent == nil {
+		return
+	}
+	_ = onEvent(eventType, payload)
+}
+
+func normalizeRAGFallbackReason(status apprag.RetrieveStatus, fallback string) string {
+	value := strings.TrimSpace(string(status))
+	if value == "" || value == string(apprag.RetrieveStatusHit) {
+		return fallback
+	}
+	return value
+}
+
+func processTraceRetrievalStatus(reason string) string {
+	switch strings.TrimSpace(reason) {
+	case string(apprag.RetrieveStatusLowScore):
+		return processTraceStatusLowScore
+	case string(apprag.RetrieveStatusEmpty):
+		return processTraceStatusEmpty
+	default:
+		return processTraceStatusIncomplete
+	}
+}
+
+func processTraceFallbackMode(hasFullText bool) string {
+	if hasFullText {
+		return processTraceFallbackFullText
+	}
+	return processTraceFallbackUnavailable
+}
+
+const knowledgeBaseNoEvidenceNotice = "An explicitly selected knowledge base returned no sufficiently relevant evidence for this request. Do not claim that the answer is supported by the knowledge base. If you answer from general knowledge, state that limitation clearly."
+
+func ragFileObjectNames(items []model.FileObject) []string {
+	names := make([]string, 0, len(items))
+	for _, item := range items {
+		name := strings.TrimSpace(item.FileName)
+		if name == "" {
+			name = strings.TrimSpace(item.FileID)
+		}
+		if name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+func buildRAGFallbackProcessTracePayload(
+	query string,
+	fileObjs []model.FileObject,
+	result apprag.RetrieveResult,
+	reason string,
+	hasFullTextFallback bool,
+	err error,
+) *tracePayload {
+	stage := &traceStage{
+		Kind:           processTraceKindRetrieval,
+		Status:         processTraceRetrievalStatus(reason),
+		Fallback:       processTraceFallbackMode(hasFullTextFallback),
+		FileCount:      len(fileObjs),
+		CandidateCount: result.CandidateCount,
+		FilteredCount:  result.FilteredCount,
+		MaxScore:       result.MaxScore,
+		Reason:         strings.TrimSpace(firstNonEmptyString(reason, result.Reason)),
+	}
+	payload := &tracePayload{
+		QueryChars:     len([]rune(strings.TrimSpace(query))),
+		FileNames:      ragFileObjectNames(fileObjs),
+		Status:         strings.TrimSpace(reason),
+		Reason:         strings.TrimSpace(result.Reason),
+		CandidateCount: result.CandidateCount,
+		FilteredCount:  result.FilteredCount,
+		MaxScore:       result.MaxScore,
+		TraceStage:     stage,
+	}
+	if err != nil {
+		payload.Error = ragFallbackErrorMessage(result.Status, err)
+	}
+	return payload
+}
+
+func (s *Service) sendMessageInternal(
+	ctx context.Context,
+	input SendMessageInput,
+	onDelta func(string) error,
+	preferStream bool,
+) (result *SendMessageResult, retErr error) {
+	ctx, sendSpan := platformtracing.Start(ctx, "conversation.send",
+		trace.WithAttributes(
+			attribute.Int64("conversation.id", int64(input.ConversationID)),
+			attribute.Int64("user.id", int64(input.UserID)),
+			attribute.String("conversation.model", strings.TrimSpace(input.PlatformModelName)),
+			attribute.Bool("conversation.stream", preferStream),
+			attribute.Int("conversation.file_count", len(input.FileIDs)),
+			attribute.Int("conversation.tool_count", len(input.SelectedToolIDs)),
+		),
+	)
+	defer func() {
+		platformtracing.RecordError(sendSpan, retErr)
+		sendSpan.End()
+	}()
+
+	// application 层保留兜底校验，保证非 HTTP 调用路径也遵守同一 MCP 工具数量策略。
+	if err := s.ValidateSelectedToolIDs(input.SelectedToolIDs); err != nil {
+		return nil, err
+	}
+
+	startedAt := time.Now()
+	runID := normalizeRunID(input.ClientRunID)
+	if runID == "" {
+		runID = "run_" + normalizePublicID(uuid.NewString())
+	}
+	var moderationCoord *appcm.RunCoordinator
+
+	conversation, err := s.repo.GetConversationByUser(ctx, input.ConversationID, input.UserID)
+	if err != nil {
+		return nil, ErrConversationNotFound
+	}
+
+	// Agent 群组会话走独立的串行编排器（主管/成员状态机，逐 Attempt 计费）。
+	if conversation.AgentGroupID != nil && s.agentGroupRunStore != nil {
+		return s.executeAgentGroupRun(ctx, input, onDelta, preferStream, conversation, runID, startedAt)
+	}
+
+	branchPreparation, err := s.prepareMessageSendBranch(ctx, &input)
+	if err != nil {
+		retErr = err
+		return nil, err
+	}
+	branchState := branchPreparation.branchState
+	normalizedBranchReason := branchPreparation.normalizedBranchReason
+	reuseUserMessage := branchPreparation.reuseUserMessage
+	if input.Cancelable {
+		cancelCtx, cancel := context.WithCancel(ctx)
+		ctx = cancelCtx
+		if err = s.generationStreams.register(ctx, runID, input.UserID, conversation.PublicID, cancel); err != nil {
+			retErr = err
+			return nil, err
+		}
+	}
+
+	currentPlatformModelName := strings.TrimSpace(conversation.Model)
+	requestedPlatformModelName := strings.TrimSpace(input.PlatformModelName)
+	targetPlatformModelName := currentPlatformModelName
+	if requestedPlatformModelName != "" {
+		targetPlatformModelName = requestedPlatformModelName
+	}
+	modelChanged := targetPlatformModelName != "" && targetPlatformModelName != currentPlatformModelName
+	if targetPlatformModelName != "" {
+		conversation.Model = targetPlatformModelName
+		conversation.Provider = inferProvider(targetPlatformModelName)
+	}
+
+	var userMessage *model.Message
+	var assistantMessage *model.Message
+	var traceRecorder *messageTraceRecorder
+	var streamedText strings.Builder
+	var toolCallRows []model.ToolCall
+	var persistedToolCallKeys map[string]struct{}
+	var resolvedRoute *channel.ResolvedRoute
+	var filteredOptions map[string]interface{}
+	var totalServerSideToolUsage map[string]int64
+	var totalMCPToolUsage []MCPToolUsageItem
+	var responsesBackgroundRouteConfig llm.RouteConfig
+	var responsesBackgroundRecovery openAIResponsesBackgroundRecoveryState
+	responsesBackgroundUsageRecovered := false
+	usageAccumulator := &messageUsageAccumulator{}
+	upstreamCallStarted := false
+	runState := newMessageSendRunState(s, input, conversation, startedAt, runID)
+	run := runState.run
+	if err := s.claimConversationRun(ctx, run); err != nil {
+		retErr = err
+		return nil, err
+	}
+	runState.reuseUserMessage = reuseUserMessage
+	runState.bind(&userMessage, &assistantMessage, &traceRecorder, &result, ctx)
+	defer func() {
+		if retErr != nil {
+			retainedOutput := false
+			if errors.Is(retErr, ErrMessageGenerationCanceled) || llm.RequestWasAccepted(retErr) {
+				if usage, ok := s.recoverOpenAIResponsesBackgroundUsage(ctx, responsesBackgroundRouteConfig, responsesBackgroundRecovery); ok {
+					responsesBackgroundUsageRecovered = true
+					if delta := diffLLMUsage(usage, responsesBackgroundRecovery.ObservedUsage); delta != (llm.Usage{}) {
+						usageAccumulator.addObservedUsage(delta)
+					}
+				}
+			}
+			estimatedOutputTokens, estimatedReasoningTokens := usageAccumulator.interruptedOutputTokens()
+			if retained := s.persistInterruptedMessageGeneration(ctx, persistInterruptedMessageGenerationInput{
+				EstimatedOutputTokens:    estimatedOutputTokens,
+				EstimatedReasoningTokens: estimatedReasoningTokens,
+				SendInput:                input,
+				UserMessage:              userMessage,
+				AssistantMessage:         assistantMessage,
+				AssistantText:            streamedText.String(),
+				AssistantReasoningText:   traceRecorder.upstreamThinkContent(),
+				EstimatedInputTokens:     usageAccumulator.interruptedInputTokens(),
+				UpstreamCallStarted:      upstreamCallStarted,
+				Usage:                    usageAccumulator.usage(),
+				UsageRecovered:           responsesBackgroundUsageRecovered,
+				AssistantLatency:         time.Since(startedAt).Milliseconds(),
+				Error:                    retErr,
+				ToolCallRows:             toolCallRows,
+				PersistedToolCallKeys:    persistedToolCallKeys,
+				TraceRecorder:            traceRecorder,
+				Route:                    resolvedRoute,
+				EffectiveOptions:         filteredOptions,
+				ServerSideToolUsage:      totalServerSideToolUsage,
+				MCPToolUsage:             totalMCPToolUsage,
+				StartedAt:                startedAt,
+				ReuseUserMessage:         reuseUserMessage,
+			}); retained != nil {
+				result = retained
+				retainedOutput = true
+				applyRetainedGenerationRunUsage(run, retained, len(toolCallRows), startedAt)
+			}
+			// Input checks and any retained visible output continue after
+			// cancel/interrupt/error; either surface may still block the turn.
+			if moderationCoord != nil {
+				if result == nil && userMessage != nil && assistantMessage != nil {
+					result = &SendMessageResult{
+						UserMessage:      *userMessage,
+						AssistantMessage: *assistantMessage,
+						Billable:         false,
+						StartedAt:        startedAt,
+					}
+				}
+				if result != nil && retainedOutput {
+					s.completeModerationAfterInterruption(
+						context.Background(),
+						moderationCoord,
+						result,
+						moderationOutputText(streamedText.String(), traceRecorder.upstreamThinkContent()),
+					)
+				} else {
+					s.completeModerationAfterFailure(context.Background(), moderationCoord, result)
+				}
+			}
+		}
+		runState.finalize(ctx, retErr)
+		if retErr != nil && result == nil && userMessage != nil && assistantMessage != nil {
+			latencyMS := time.Since(startedAt).Milliseconds()
+			if latencyMS < 0 {
+				latencyMS = 0
+			}
+			result = &SendMessageResult{
+				UserMessage:      *userMessage,
+				AssistantMessage: *assistantMessage,
+				Billable:         false,
+				LatencyMS:        latencyMS,
+				StartedAt:        startedAt,
+			}
+			if resolvedRoute != nil {
+				result.UpstreamID = resolvedRoute.UpstreamID
+				result.UpstreamName = resolvedRoute.UpstreamName
+				result.PlatformModelName = resolvedRoute.PlatformModelName
+				result.RoutedBindingCode = resolvedRoute.BindingCode
+				result.UpstreamModelName = resolvedRoute.UpstreamModel
+				result.UpstreamProtocol = resolvedRoute.Protocol
+			}
+		}
+	}()
+
+	resolvedAttachments, err := s.resolveAttachments(ctx, input.UserID, input.FileIDs)
+	if err != nil {
+		retErr = err
+		return nil, err
+	}
+
+	pair, err := s.createMessagePair(ctx, input, runID, branchPreparation, resolvedAttachments, nil)
+	if err != nil {
+		retErr = err
+		return nil, err
+	}
+	userMessage = pair.user
+	assistantMessage = pair.assistant
+	traceRecorder = newMessageTraceRecorder(s, ctx, assistantMessage, input.OnEvent)
+	moderationCoord = s.startModerationRun(ctx, input, runID, userMessage, assistantMessage, run)
+
+	if s.routeResolver == nil || s.llmClient == nil {
+		retErr = ErrModelRouteNotConfigured
+		return nil, retErr
+	}
+
+	routeResolveInput := channel.ResolveRouteInput{
+		PlatformModelName: conversation.Model,
+		ModelScope:        input.ModelScope,
+		UserModelID:       input.UserModelID,
+		TaskType:          channel.TaskTypeChat,
+		Scope:             channel.RouteScopeUser,
+		UserID:            input.UserID,
+		ConversationID:    input.ConversationID,
+		RequestID:         strings.TrimSpace(input.RequestID),
+	}
+	route, err := s.routeResolver.ResolveRoute(ctx, routeResolveInput)
+	if err != nil {
+		if errors.Is(err, channel.ErrModelAccessDenied) {
+			retErr = ErrModelAccessDenied
+			return nil, retErr
+		}
+		if errors.Is(err, channel.ErrRouteNotFound) || errors.Is(err, channel.ErrModelNotFound) {
+			retErr = ErrModelRouteNotConfigured
+			return nil, retErr
+		}
+		if errors.Is(err, channel.ErrAllRoutesUnavailable) {
+			retErr = wrapUpstreamRequestError(err)
+			return nil, retErr
+		}
+		retErr = err
+		return nil, err
+	}
+	resolvedRoute = route
+	reasoningContentPassback := s.reasoningContentPassbackEnabled(ctx, input.UserID, route)
+	applyRouteToRun := func(currentRoute *channel.ResolvedRoute) {
+		resolvedRoute = currentRoute
+		run.Endpoint = llm.DefaultEndpointForAdapter(currentRoute.Protocol)
+		run.ProviderProtocol = currentRoute.Protocol
+		run.UpstreamID = currentRoute.UpstreamID
+		run.UpstreamModelID = currentRoute.UpstreamModelID
+		run.UpstreamName = currentRoute.UpstreamName
+		run.PlatformModelName = currentRoute.PlatformModelName
+		run.RoutedBindingCode = currentRoute.BindingCode
+		run.ModelVendor = currentRoute.ModelVendor
+		run.ModelIcon = currentRoute.ModelIcon
+		run.UpstreamModelName = currentRoute.UpstreamModel
+	}
+	if modelChanged || strings.TrimSpace(conversation.Model) != strings.TrimSpace(route.PlatformModelName) {
+		conversation.Model = strings.TrimSpace(route.PlatformModelName)
+		conversation.Provider = inferProvider(conversation.Model)
+		if err = s.repo.UpdateConversationModel(ctx, input.ConversationID, conversation.Model, conversation.Provider); err != nil {
+			retErr = err
+			return nil, err
+		}
+	}
+	applyRouteToRun(route)
+	if strings.TrimSpace(run.Provider) == "" {
+		run.Provider = inferProvider(conversation.Model)
+	}
+
+	// 构建完整活跃分支路径；压缩裁剪先于模型预算截断，避免摘要和全量历史重复发送。
+	contextMessages := filterBlockedMessages(buildBranchMessagePath(branchState, userMessage))
+	cfg := s.cfg.Snapshot()
+	compactPolicy := s.resolveContextCompactionPolicy(ctx, cfg, input.UserID)
+
+	// 并行预取：Snapshot + UserMemory + DocCards 提前加载，隐藏 DB 延迟。
+	type prefetchData struct {
+		snapshot     *model.ContextSnapshot
+		userMemories []domainmemory.UserMemory
+		docCards     []appdoccard.CardView
+	}
+	prefetchCh := make(chan prefetchData, 1)
+	go func() {
+		var r prefetchData
+		if compactPolicy.EffectiveEnabled() {
+			r.snapshot, _ = s.getCachedSnapshot(ctx, input.ConversationID)
+		}
+		if s.memoryRecorder != nil {
+			r.userMemories, _ = s.getCachedUserMemories(ctx, input.UserID)
+		}
+		r.docCards = s.getCachedDocCards(ctx, input.UserID)
+		prefetchCh <- r
+	}()
+
+	// 读取用户的文件处理模式偏好（auto / full_context / rag）。
+	fileMode := "auto"
+	capability := s.resolveChatFileCapability(ctx)
+	if fm, fmErr := s.getUserSettingCached(ctx, input.UserID, "chat.file_mode"); fmErr == nil && fm != "" {
+		fileMode = fm
+	}
+
+	// 收集并行预取结果，再规划本轮可发送的 PromptScope。
+	prefetch := <-prefetchCh
+	contextMessages = s.expandContextMessagesToSnapshotBoundary(ctx, input.ConversationID, userMessage.ID, contextMessages, prefetch.snapshot, compactPolicy)
+	// 快照扩展可能重新加载数据库中的原始 error 状态；在最终分支路径上统一恢复可用的重试上下文。
+	contextMessages = recoverAssistantRetryUserStates(contextMessages)
+	if snapshot := s.maybeCompactContextBeforePrompt(ctx, cfg, compactPolicy, route, conversation.Model, input, runID, contextMessages); snapshot != nil {
+		// 立即将新快照用于本轮 PromptScope，不能等待成功响应后的异步维护任务。
+		prefetch.snapshot = snapshot
+	}
+	contextMessages = append(s.resolveConversationReferences(ctx, input.UserID, input.Content), contextMessages...)
+	promptScope := buildPromptScope(contextMessages, prefetch.snapshot, compactPolicy)
+	promptMessages := s.applyContextTokenBudget(promptScope.activeMessages(), route.UpstreamModel, route.ModelCapabilitiesJSON, reasoningContentPassback)
+	ragQuery := buildRAGQuery(promptMessages, input.Content, cfg.RAGQueryHistoryTurns)
+	historicalScope := promptScope.historicalMessageScope(input.ConversationID, input.UserID, userMessage.ID)
+
+	// 语义召回必须先限定到当前活跃分支，再由向量存储执行 Top-K，避免 sibling 分支占用名额。
+	// 召回仍与附件和 RAG 处理并行，200ms 超时后按原行为优雅跳过。
+	var recallCh chan []model.MessageChunk
+	if cfg.EmbeddingEnabled && cfg.SemanticContextEnabled && historicalScope.Valid() {
+		recallCh = make(chan []model.MessageChunk, 1)
+		go func() {
+			recallCtx, cancel := context.WithTimeout(ctx, semanticRecallDeadline)
+			defer cancel()
+			recallCh <- s.recallSemanticContext(recallCtx, historicalScope, input.Content)
+		}()
+	}
+
+	conversationFileIDs := collectConversationFileIDs(promptMessages, input.FileIDs)
+	conversationAttachments, err := s.resolveConversationFileContext(ctx, input.UserID, conversationFileIDs, input.FileIDs)
+	if err != nil {
+		retErr = err
+		return nil, err
+	}
+	conversationAttachments = bindAttachmentMessageRoles(conversationAttachments, promptMessages)
+	conversationAttachments, err = s.hydrateAttachmentsForSend(ctx, input.UserID, conversationAttachments, input.OnEvent)
+	if err != nil {
+		retErr = err
+		return nil, err
+	}
+	currentAttachments := filterCurrentAttachments(conversationAttachments)
+	userMessage.Attachments = marshalAttachmentSnapshots(currentAttachments)
+
+	supportsVision := modelSupportsVision(route.PlatformModelName, route.ModelCapabilitiesJSON)
+	toolRuntime, err := s.resolveSelectedToolRuntimeForModel(ctx, input.SelectedToolIDs, supportsVision)
+	if err != nil {
+		retErr = err
+		return nil, err
+	}
+	if strings.TrimSpace(conversation.ProjectPublicID) == "" {
+		toolRuntime = toolRuntime.withoutProjectTools()
+	}
+	toolRuntime.bindMultimodalAnalyzerWithHistory(cfg, route, conversationAttachments, true)
+	toolRuntime.bindCredentialSecretRefs(input.UserID, input.ConversationID, runID)
+	toolRuntime = toolRuntime.visibleRuntime()
+	var attachmentImports []attachmentImportPath
+	if len(toolRuntime.authorizedMCPServers) > 0 {
+		var cleanupAttachmentImports func()
+		attachmentImports, cleanupAttachmentImports, err = s.syncCurrentAttachmentsToImports(
+			ctx,
+			input.UserID,
+			input.ConversationID,
+			currentAttachments,
+		)
+		if cleanupAttachmentImports != nil {
+			defer cleanupAttachmentImports()
+		}
+		if err != nil {
+			if s.logger != nil {
+				s.logger.Warn("attachment_import_sync_failed",
+					zap.Uint("user_id", input.UserID),
+					zap.Uint("conversation_id", input.ConversationID),
+					zap.Error(err),
+				)
+			}
+			attachmentImports = nil
+		}
+	}
+	imageAttachmentRoutingActive := false
+	processorAttachments := currentAttachments
+	imageProcessing := imageAttachmentProcessingResult{}
+	if !toolRuntime.multimodalAnalyzerHandlesCurrentAttachments() {
+		imageProcessing, err = s.processImageAttachments(ctx, imageAttachmentProcessingInput{
+			UserID:                 input.UserID,
+			ConversationID:         input.ConversationID,
+			MessageID:              assistantMessage.ID,
+			RequestID:              input.RequestID,
+			RunID:                  runID,
+			UserPrompt:             input.Content,
+			Attachments:            processorAttachments,
+			AttachmentImports:      attachmentImports,
+			Runtime:                toolRuntime,
+			TraceRecorder:          traceRecorder,
+			AllowInactiveProcessor: !supportsVision,
+		})
+		totalMCPToolUsage = mergeMCPToolUsage(totalMCPToolUsage, imageProcessing.MCPToolUsage)
+		toolCallRows = append(toolCallRows, imageProcessing.Rows...)
+		mergeToolCallPersistenceKeys(&persistedToolCallKeys, imageProcessing.PersistedToolCallKeys)
+		if err != nil {
+			retErr = err
+			return nil, err
+		}
+	}
+	if imageProcessing.Routed {
+		imageAttachmentRoutingActive = true
+		toolRuntime = toolRuntime.withoutAttachmentProcessor()
+	}
+
+	fileContextPlan := buildConversationFileContextPlan(conversationAttachments, fileMode, cfg, route.UpstreamModel, route.ModelCapabilitiesJSON, capability.RAGAvailable)
+	if imageProcessing.Routed {
+		fileContextPlan = withoutCurrentImageAttachments(fileContextPlan)
+	}
+	knowledgeBaseFiles, err := s.resolveKnowledgeBaseRAGFiles(
+		ctx,
+		input.UserID,
+		input.KnowledgeBaseIDs,
+		cfg.RAGEnabled && cfg.EmbeddingEnabled && capability.RAGAvailable,
+	)
+	if err != nil {
+		retErr = err
+		return nil, err
+	}
+
+	contextAssembler := NewContextAssembler(int64(cfg.ContextMaxInputTokens))
+	var nonVisionExtractReader func(context.Context, uint, string) string
+	if !toolRuntime.multimodalAnalyzerHandlesCurrentAttachments() {
+		nonVisionExtractReader = s.nonVisionImageExtractText
+	}
+	userCtx := userContextInput{
+		ImageAnalyses:          append([]imageAttachmentAnalysis{}, imageProcessing.Analyses...),
+		SupportsVision:         supportsVision,
+		UserID:                 input.UserID,
+		NonVisionExtractReader: nonVisionExtractReader,
+	}
+	var prefixMemories []domainmemory.UserMemory
+	preferencePrompt := ""
+	if promptScope.Snapshot != nil {
+		if snapshotSummary := strings.TrimSpace(promptScope.Snapshot.SummaryText); snapshotSummary != "" {
+			userCtx.Snapshot = &snapshotContext{
+				Summary:  snapshotSummary,
+				FromTurn: promptScope.Snapshot.FromTurn,
+				ToTurn:   promptScope.Snapshot.ToTurn,
+				Strategy: promptScope.Snapshot.Strategy,
+			}
+		}
+	}
+	if len(prefetch.userMemories) > 0 {
+		prefMems := filterMemoriesByScope(prefetch.userMemories, domainmemory.CategoryPreference)
+		if len(prefMems) > 0 {
+			prefixMemories = prefMems
+		}
+		preferencePrompt = buildMemorySystemPrompt(prefetch.userMemories, 400)
+		otherMems := filterMemoriesByScope(prefetch.userMemories, domainmemory.CategoryCapability, domainmemory.CategoryExperience)
+		if len(otherMems) > 0 {
+			userCtx.Memory = s.selectRelevantUserMemories(ctx, input.UserID, ragQuery, otherMems, 5)
+		}
+	}
+	if len(prefetch.docCards) > 0 {
+		var projectID, roleID uint
+		if conversation.ProjectID != nil {
+			projectID = *conversation.ProjectID
+		}
+		if conversation.RoleID != nil {
+			roleID = *conversation.RoleID
+		}
+		userCtx.DocCards = matchDocCards(input.Content, prefetch.docCards, projectID, roleID, docCardMaxMatched)
+	}
+	processTraceAttachments := attachmentProcessTraceItems(fileContextPlan.Attachments)
+	if traceRecorder != nil && shouldShowAttachmentProcessTrace(processTraceAttachments) {
+		summary, markdown, payload := buildAttachmentProcessTrace(fileMode, processTraceAttachments)
+		traceRecorder.appendProcessSection(summary, markdown, payload, messageTraceStatusStreaming)
+	}
+
+	ragFallbacks := ragFallbackEvidencesFromAttachments(
+		filterAttachmentsByContextMode(fileContextPlan.FullAttachments, fileContextModeRAGFallback),
+		"rag_unavailable",
+		"",
+	)
+	retrievalRAGFallbacks := make([]ragFallbackEvidence, 0)
+	ragContextChunks := make([]model.RAGChunk, 0)
+	ragImageEvidence := make([]AttachmentInput, 0)
+	if cfg.RAGEnabled && (len(fileContextPlan.RAGAttachments) > 0 || len(knowledgeBaseFiles) > 0) {
+		readyObjs := mergeRAGFileObjects(fileContextPlanRAGObjects(fileContextPlan.RAGAttachments), knowledgeBaseFiles)
+		knowledgeBaseFileIDs := make(map[string]struct{}, len(knowledgeBaseFiles))
+		for _, file := range knowledgeBaseFiles {
+			if fileID := strings.TrimSpace(file.FileID); fileID != "" {
+				knowledgeBaseFileIDs[fileID] = struct{}{}
+			}
+		}
+		emitEvent(input.OnEvent, "rag_search", map[string]interface{}{
+			"message": "正在检索相关内容…",
+		})
+		ragCtx, ragSpan := platformtracing.Start(ctx, "conversation.rag.retrieve",
+			trace.WithAttributes(
+				attribute.Int64("conversation.id", int64(input.ConversationID)),
+				attribute.Int64("user.id", int64(input.UserID)),
+				attribute.Int("conversation.rag.file_count", len(readyObjs)),
+			),
+		)
+		ragCallCtx := ragCtx
+		ragCancel := func() {}
+		if cfg.RAGWaitReadyMS > 0 {
+			ragCallCtx, ragCancel = context.WithTimeout(ragCtx, time.Duration(cfg.RAGWaitReadyMS)*time.Millisecond)
+		}
+		ragResult, ragErr := s.ragSvc.RetrieveWithStatus(ragCallCtx, apprag.RetrieveInput{
+			UserID:   input.UserID,
+			Query:    ragQuery,
+			FileObjs: readyObjs,
+		})
+		ragCancel()
+		platformtracing.RecordError(ragSpan, ragErr)
+		ragSpan.SetAttributes(
+			attribute.String("conversation.rag.status", string(ragResult.Status)),
+			attribute.String("conversation.rag.reason", strings.TrimSpace(ragResult.Reason)),
+			attribute.Int("conversation.rag.candidate_count", ragResult.CandidateCount),
+			attribute.Int("conversation.rag.filtered_count", ragResult.FilteredCount),
+			attribute.Float64("conversation.rag.max_score", float64(ragResult.MaxScore)),
+			attribute.Bool("conversation.rag.cached", ragResult.Cached),
+		)
+		ragSpan.End()
+		ragChunksRaw := ragResult.Chunks
+		ragChunks := contextAssembler.DeduplicateRAGChunks(ragChunksRaw)
+		knowledgeBaseHit := false
+		for _, chunk := range ragChunks {
+			if _, ok := knowledgeBaseFileIDs[strings.TrimSpace(chunk.FileID)]; ok {
+				knowledgeBaseHit = true
+				break
+			}
+		}
+		if ragErr != nil {
+			s.logger.Warn("rag_retrieval_failed",
+				zap.String("trace_id", traceid.FromContext(ctx)),
+				zap.Uint("user_id", input.UserID),
+				zap.Error(ragErr),
+			)
+			fallbacks, skipped := splitRetrievalFallbackAttachments(fileContextPlan.RAGAttachments, cfg)
+			fallbackLabel := "已改用全文"
+			if len(fallbacks) == 0 {
+				fallbackLabel = "没有可用全文"
+			}
+			if traceRecorder != nil {
+				traceRecorder.appendProcessSection(
+					"内容检索未完成，"+fallbackLabel,
+					formatTraceStep(
+						"内容检索",
+						fmt.Sprintf("文件已检索，检索未完成，%s。", fallbackLabel),
+					),
+					buildRAGFallbackProcessTracePayload(ragQuery, readyObjs, ragResult, normalizeRAGFallbackReason(ragResult.Status, "rag_error"), len(fallbacks) > 0, ragErr),
+					messageTraceStatusStreaming,
+				)
+			}
+			fallbackReason := normalizeRAGFallbackReason(ragResult.Status, "rag_error")
+			evidences := ragFallbackEvidencesFromAttachments(fallbacks, fallbackReason, strings.TrimSpace(ragErr.Error()))
+			ragFallbacks = append(ragFallbacks, evidences...)
+			retrievalRAGFallbacks = append(retrievalRAGFallbacks, evidences...)
+			appendRAGFallbackSkippedTrace(traceRecorder, skipped, fallbackReason)
+			// A selected knowledge base is an explicit source requirement. Continuing
+			// without it would produce an apparently successful answer that silently
+			// ignored the user's configured corpus. Attachment-only requests may still
+			// use their bounded full-text fallback above.
+			if len(input.KnowledgeBaseIDs) > 0 {
+				retErr = ErrKnowledgeBaseUnavailable
+				return nil, retErr
+			}
+		} else if len(input.KnowledgeBaseIDs) > 0 && ragResult.Status == apprag.RetrieveStatusUnavailable {
+			retErr = ErrKnowledgeBaseUnavailable
+			return nil, retErr
+		} else if len(ragChunks) == 0 {
+			fallbacks, skipped := splitRetrievalFallbackAttachments(fileContextPlan.RAGAttachments, cfg)
+			fallbackLabel := "已改用全文"
+			if len(fallbacks) == 0 {
+				fallbackLabel = "没有可用全文"
+			}
+			ragStatus := normalizeRAGFallbackReason(ragResult.Status, "rag_empty")
+			missLabel := "未检索到相关片段"
+			if ragResult.Status == apprag.RetrieveStatusLowScore {
+				missLabel = "检索结果低于相似度阈值"
+			}
+			if traceRecorder != nil {
+				traceRecorder.appendProcessSection(
+					"未检索到相关片段，"+fallbackLabel,
+					formatTraceStep("内容检索", fmt.Sprintf("文件已检索，%s，%s。", missLabel, fallbackLabel)),
+					buildRAGFallbackProcessTracePayload(ragQuery, readyObjs, ragResult, ragStatus, len(fallbacks) > 0, nil),
+					messageTraceStatusStreaming,
+				)
+			}
+			evidences := ragFallbackEvidencesFromAttachments(fallbacks, ragStatus, "")
+			ragFallbacks = append(ragFallbacks, evidences...)
+			retrievalRAGFallbacks = append(retrievalRAGFallbacks, evidences...)
+			appendRAGFallbackSkippedTrace(traceRecorder, skipped, ragStatus)
+			if len(input.KnowledgeBaseIDs) > 0 {
+				userCtx.RAGNotice = knowledgeBaseNoEvidenceNotice
+			}
+		} else {
+			if traceRecorder != nil {
+				summary, markdown, payload := buildRAGProcessTrace(ragQuery, readyObjs, ragChunks)
+				traceRecorder.appendProcessSection(summary, markdown, payload, messageTraceStatusStreaming)
+			}
+			ragContextChunks = append(ragContextChunks, ragChunks...)
+			ragImageEvidence = append(ragImageEvidence, retrievedImageEvidence(ragChunks, readyObjs, fileContextPlan.FullAttachments)...)
+			if len(input.KnowledgeBaseIDs) > 0 && !knowledgeBaseHit {
+				userCtx.RAGNotice = knowledgeBaseNoEvidenceNotice
+			}
+		}
+	}
+	stableFullContextAttachments := append([]AttachmentInput{}, fileContextPlan.FullAttachments...)
+	stableFullContextAttachments = append(stableFullContextAttachments, ragFallbackEvidenceAttachments(retrievalRAGFallbacks)...)
+	stableFullContextAttachments, fullContextBudgetSkipped := trimFullContextAttachments(
+		stableFullContextAttachments,
+		fullContextAttachmentTokenBudget(cfg, route.UpstreamModel, route.ModelCapabilitiesJSON),
+	)
+	appendRAGFallbackSkippedTrace(traceRecorder, fullContextBudgetSkipped, "full_context_budget")
+	// 检索命中的图片随本轮消息发送，但不进入稳定上下文：它随查询变化，不能参与前缀缓存指纹。
+	turnImageAttachments := append(append([]AttachmentInput{}, stableFullContextAttachments...), ragImageEvidence...)
+	userCtx.Attachments = imageAttachmentsForCurrentUser(turnImageAttachments)
+	userCtx.RAGChunks = ragContextChunks
+	assistantMessage.KnowledgeSources = messageKnowledgeSourcesFromRAGChunks(ragContextChunks)
+	// 语义召回注入：收集异步结果（与 RAG 解耦，独立运行）。
+	// recallCh 为 nil 时（未启用语义召回或当前分支没有历史消息）直接跳过。
+	//
+	// 必须阻塞等待（不用 select default），原因：
+	//   - 无附件时 hydrateAttachmentsForSend 几乎瞬间返回（~5ms），
+	//     非阻塞会在 goroutine 完成前（~50-200ms）直接跳过，导致召回永远触发不了。
+	//   - goroutine 持有 200ms context deadline，recallSemanticContext 失败时返回空列表，
+	//     因此 <-recallCh 最多阻塞 semanticRecallDeadline（200ms），不会死锁。
+	//   - 有附件时 goroutine 早已完成（附件处理 >1s >> 200ms），等待开销为零。
+	if recallCh != nil {
+		userCtx.RecallChunks = <-recallCh // 阻塞等待，最多 semanticRecallDeadline（200ms）
+	}
+	userCtx.HistoricalArtifacts = s.recallHistoricalContextArtifacts(
+		ctx,
+		historicalScope,
+		promptScope.Snapshot != nil,
+		input.Content,
+		collectConversationImageFileIDs(promptScope.activeMessages()),
+		ragContextChunks,
+		ragFallbackEvidenceAttachments(ragFallbacks),
+		userCtx.RecallChunks,
+	)
+	userCtx.CurrentArtifacts = s.persistPromptContextArtifacts(ctx, promptContextArtifactInput{
+		ConversationID: input.ConversationID,
+		UserID:         input.UserID,
+		MessageID:      assistantMessage.ID,
+		RunID:          run.RunID,
+		Query:          ragQuery,
+		RAGChunks:      ragContextChunks,
+		RAGFallbacks:   ragFallbacks,
+		RecallChunks:   userCtx.RecallChunks,
+		Memories:       userCtx.Memory,
+	})
+	skillPrompts, err := s.resolveSkillPrompts(ctx, input)
+	if err != nil {
+		retErr = err
+		return nil, err
+	}
+	if traceRecorder != nil && skillPrompts != nil {
+		skillTitles := skillPromptTitles(skillPrompts.Skills)
+		traceRecorder.appendProcessSection(
+			fmt.Sprintf("已提供 %d 个 Skill 上下文", len(skillPrompts.Skills)),
+			formatTraceStep("Skill", fmt.Sprintf("本轮已加载 Skill：%s。包含 SKILL.md 内容，相关时使用。", strings.Join(skillTitles, "、"))),
+			&tracePayload{
+				TraceStage: &traceStage{
+					Kind:   "skill_context",
+					Status: messageTraceStatusStreaming,
+				},
+				SkillCount:    len(skillPrompts.Skills),
+				SkillIDs:      skillPromptIDs(skillPrompts.Skills),
+				SkillTitles:   skillTitles,
+				SkillTriggers: skillPromptTriggers(skillPrompts.Skills),
+			},
+			messageTraceStatusStreaming,
+		)
+	}
+	routePromptInput := messageRoutePromptInput{
+		UserContent:             input.Content,
+		UserID:                  input.UserID,
+		ConversationID:          input.ConversationID,
+		ProjectSystemPrompt:     conversation.ProjectSystemPrompt,
+		RoleSystemPrompt:        conversation.RoleSystemPrompt,
+		HTMLVisualPromptEnabled: input.HTMLVisualPromptEnabled,
+		DomainMessages:          promptScope.activeMessages(),
+		StableAttachments:       stableFullContextAttachments,
+		AttachmentImports:       attachmentImports,
+		DynamicContext:          userCtx,
+		PreferencePrompt:        preferencePrompt,
+		SkillPrompts:            skillPrompts,
+		ToolRuntime:             toolRuntime,
+		SkipImageAttachments:    imageAttachmentRoutingActive,
+		Config:                  cfg,
+	}
+	buildRoutePrompt := func(currentRoute *channel.ResolvedRoute) (PromptPlan, bool, error) {
+		passbackEnabled := s.reasoningContentPassbackEnabled(ctx, input.UserID, currentRoute)
+		currentInput := routePromptInput
+		currentInput.ToolRuntime = toolRuntime
+		currentInput.ReasoningContentPassback = passbackEnabled
+		plan, buildErr := s.buildMessageRoutePrompt(ctx, currentRoute, currentInput)
+		return plan, passbackEnabled, buildErr
+	}
+
+	promptPlan, reasoningContentPassback, err := buildRoutePrompt(route)
+	if err != nil {
+		retErr = err
+		return nil, err
+	}
+	llmMessages := promptPlan.Messages
+	estimatedPromptTokens := int64(0)
+
+	attributionReferer, attributionTitle := s.llmAttribution()
+	routeConfig := messageRouteConfig(route, attributionReferer, attributionTitle)
+	responsesBackgroundRouteConfig = routeConfig
+	filteredOptions = filterModelOptions(input.Options, route.Protocol, modelOptionPolicyConfig{
+		Mode:                  cfg.ModelOptionPolicyMode,
+		AllowedPathsJSON:      cfg.ModelOptionAllowedPaths,
+		DeniedPathsJSON:       cfg.ModelOptionDeniedPaths,
+		ModelCapabilitiesJSON: route.ModelCapabilitiesJSON,
+	})
+	if shouldApplyReasoningPassbackRequestOptions(
+		reasoningContentPassback,
+		route.ReasoningPassbackRequestOptions,
+		llmMessages,
+	) {
+		filteredOptions = withReasoningPassbackRequestOptions(
+			filteredOptions,
+			route.ReasoningPassbackRequestOptions,
+			input.Options,
+			route.ModelCapabilitiesJSON,
+		)
+	}
+	promptCacheSessionKey := strings.TrimSpace(conversation.SessionKey)
+	if promptCacheSessionKey == "" {
+		promptCacheSessionKey = strings.TrimSpace(conversation.PublicID)
+	}
+	promptCacheKey, filteredOptions, llmMessages := configureOpenAIPromptCacheRequestForRoute(
+		route,
+		promptCacheSessionKey,
+		filteredOptions,
+		llmMessages,
+	)
+	generateInput := llm.GenerateInput{
+		RequestID:              strings.TrimSpace(input.RequestID),
+		ConversationID:         input.ConversationID,
+		ConversationPublicID:   strings.TrimSpace(conversation.PublicID),
+		ConversationSessionKey: strings.TrimSpace(conversation.SessionKey),
+		PromptCacheKey:         promptCacheKey,
+		Messages:               llmMessages,
+		Tools:                  toolRuntime.definitions,
+		Options:                filteredOptions,
+	}
+	if supportsOpenAIResponsesBackgroundMode(route) {
+		generateInput.ResponsesBackground = true
+		sendSpan.SetAttributes(attribute.Bool("conversation.responses_background", true))
+	}
+	fullLLMMessages := llmMessages
+	applyOpenAIResponsesInstructions(route, routeConfig.Endpoint, &generateInput)
+	estimatedPromptTokens = estimateGenerateInputTokens(generateInput)
+	statefulContextConfig := buildPromptContextConfigSignature(cfg)
+	statefulContextState := buildPromptContextStateSignature(stableFullContextAttachments, prefixMemories)
+	statefulPrefixFingerprint := buildPromptStateFingerprint(promptStateFingerprintInput{
+		Protocol:          route.Protocol,
+		Endpoint:          routeConfig.Endpoint,
+		UpstreamID:        route.UpstreamID,
+		UpstreamModel:     route.UpstreamModel,
+		PlatformModelName: conversation.Model,
+		ContextConfig:     statefulContextConfig,
+		ContextState:      statefulContextState,
+		Messages:          promptStatePrefixMessages(llmMessages),
+		Tools:             toolRuntime.definitions,
+		Options:           filteredOptions,
+	})
+	statefulDecision := resolveStatefulPreviousResponseID(
+		route,
+		normalizedBranchReason,
+		conversation.LastResponseID,
+		conversation.LastPromptFingerprint,
+		statefulPrefixFingerprint,
+		filteredOptions,
+	)
+	if applyStatefulResponseContinuation(routeConfig.Endpoint, statefulDecision, &generateInput) {
+		estimatedPromptTokens = estimateGenerateInputTokens(generateInput)
+		sendSpan.SetAttributes(
+			attribute.Bool("conversation.stateful_response", true),
+			attribute.Int("conversation.stateful_full_messages", len(llmMessages)),
+			attribute.Int("conversation.stateful_sent_messages", len(generateInput.Messages)),
+		)
+	} else if strings.TrimSpace(statefulDecision.DisabledReason) != "" {
+		sendSpan.SetAttributes(attribute.String("conversation.stateful_disabled_reason", statefulDecision.DisabledReason))
+	}
+	promptMode := "full"
+	if strings.TrimSpace(generateInput.PreviousResponseID) != "" {
+		promptMode = "stateful"
+	}
+	initialPromptShape := summarizePromptShape(promptMode, generateInput.Messages, fullLLMMessages, generateInput.PreviousResponseID)
+	if traceRecorder != nil {
+		traceRecorder.recordPromptTrace(buildMessagePromptTrace(messagePromptTraceInput{
+			Plan:               promptPlan.Trace,
+			Mode:               promptMode,
+			PromptFingerprint:  statefulPrefixFingerprint,
+			StatefulDecision:   statefulDecision,
+			SentMessages:       generateInput.Messages,
+			FullMessages:       fullLLMMessages,
+			PreviousResponseID: generateInput.PreviousResponseID,
+		}))
+	}
+	sendSpan.SetAttributes(promptShapeTraceAttributes("conversation.prompt", initialPromptShape)...)
+
+	maxLLMCalls := s.resolveMaxLLMCallsPerRun()
+	llmRequestCount := 0
+	firstVisibleDeltaLatencyMS := int64(0)
+	visibleDeltaCount := 0
+	attemptHadSideEffect := false
+	emitVisibleDelta := func(delta string) error {
+		if delta == "" {
+			return nil
+		}
+		visibleDeltaCount++
+		if firstVisibleDeltaLatencyMS == 0 {
+			firstVisibleDeltaLatencyMS = time.Since(startedAt).Milliseconds()
+			if firstVisibleDeltaLatencyMS < 0 {
+				firstVisibleDeltaLatencyMS = 0
+			}
+		}
+		if traceRecorder != nil {
+			traceRecorder.completeProcess()
+			traceRecorder.completeUpstreamThink()
+		}
+		if onDelta != nil {
+			if err := onDelta(delta); err != nil {
+				return err
+			}
+		}
+		streamedText.WriteString(delta)
+		return nil
+	}
+	// lastReadFileRequests 记录最近一次 LLM 调用的 read_file 请求（标记已从可见流中剥离）。
+	var lastReadFileRequests []skillFileRequest
+	var lastGenerationAttemptObservation *generationAttemptObservation
+	credentialAttemptedForRun := false
+	var credentialAttemptsForRun []credentialWrite
+	var credentialWritesForRun []credentialWrite
+	runGenerate := func(currentInput llm.GenerateInput) (*llm.GenerateOutput, error) {
+		if traceRecorder != nil {
+			traceRecorder.beginGenerationCall()
+		}
+		attemptObservation := &generationAttemptObservation{}
+		lastGenerationAttemptObservation = attemptObservation
+		tagScanner := newReadFileTagScanner()
+		callPromptMode := "full"
+		if strings.TrimSpace(currentInput.PreviousResponseID) != "" {
+			callPromptMode = "stateful"
+		}
+		streamRequested := preferStream && onDelta != nil
+		streamSupported := llm.SupportsStreamingAdapter(routeConfig.Protocol)
+		var callVisibleText strings.Builder
+		emitCallVisibleDelta := func(delta string) error {
+			visible, requests := tagScanner.consume(delta)
+			if len(requests) > 0 {
+				lastReadFileRequests = append(lastReadFileRequests, requests...)
+			}
+			if visible != "" {
+				attemptObservation.markObservable()
+				if err := emitVisibleDelta(visible); err != nil {
+					return err
+				}
+				callVisibleText.WriteString(visible)
+			}
+			return nil
+		}
+		callPromptShape := summarizePromptShape(callPromptMode, currentInput.Messages, currentInput.Messages, currentInput.PreviousResponseID)
+		usageAccumulator.beginCall(estimateGenerateInputTokens(currentInput))
+		if currentInput.ResponsesBackground {
+			responsesBackgroundRecovery = openAIResponsesBackgroundRecoveryState{Enabled: true}
+		} else {
+			responsesBackgroundRecovery = openAIResponsesBackgroundRecoveryState{}
+		}
+		generationCtx, generationSpan := platformtracing.Start(ctx, "conversation.llm.generate",
+			trace.WithAttributes(append([]attribute.KeyValue{
+				attribute.Int64("conversation.id", int64(input.ConversationID)),
+				attribute.String("llm.model", routeConfig.UpstreamModel),
+				attribute.String("llm.protocol", routeConfig.Protocol),
+				attribute.String("llm.endpoint", routeConfig.Endpoint),
+				attribute.Bool("llm.stream", streamRequested && streamSupported),
+				attribute.Bool("llm.tools_disabled", currentInput.DisableTools),
+				attribute.Bool("llm.responses_background", currentInput.ResponsesBackground),
+				attribute.Int("llm.message_count", len(currentInput.Messages)),
+				attribute.Int("llm.tool_count", len(currentInput.Tools)),
+			}, promptShapeTraceAttributes("llm.prompt", callPromptShape)...)...),
+		)
+		var generateErr error
+		defer func() {
+			platformtracing.RecordError(generationSpan, generateErr)
+			generationSpan.End()
+		}()
+
+		emitNonStreamingOutput := func(output *llm.GenerateOutput) error {
+			if output == nil || (strings.TrimSpace(output.Text) == "" && output.Reasoning == nil) {
+				return nil
+			}
+			cleanText, thinkText := splitAssistantOutputThinkingContent(output.Text)
+			if traceRecorder != nil && output.Reasoning != nil {
+				if traceRecorder.visible() && traceRecorder.onEvent != nil {
+					attemptObservation.markObservable()
+				}
+				traceRecorder.syncStructuredThink(
+					output.Reasoning.Text,
+					output.Reasoning.Summary,
+					reasoningPayload(&llm.ReasoningDelta{
+						EventType:        "response.completed",
+						ItemID:           output.Reasoning.ItemID,
+						Status:           output.Reasoning.Status,
+						Kind:             messageTraceThinkKindContent,
+						EncryptedContent: output.Reasoning.EncryptedContent,
+					}),
+				)
+			} else if traceRecorder != nil && strings.TrimSpace(thinkText) != "" {
+				if traceRecorder.visible() && traceRecorder.onEvent != nil {
+					attemptObservation.markObservable()
+				}
+				traceRecorder.syncStructuredThink(thinkText, "", nil)
+			}
+			if traceRecorder != nil {
+				traceRecorder.completeUpstreamThink()
+			}
+			if cleanText == "" && strings.TrimSpace(thinkText) == "" {
+				cleanText = strings.TrimSpace(output.Text)
+			}
+			if streamErr := emitCallVisibleDelta(cleanText); streamErr != nil {
+				return streamErr
+			}
+			output.Text = callVisibleText.String()
+			return nil
+		}
+
+		if !streamRequested || !streamSupported {
+			upstreamCallStarted = true
+			llmRequestCount++
+			output, err := s.llmClient.Generate(generationCtx, routeConfig, currentInput)
+			generateErr = err
+			if err == nil && (credentialAttemptedForRun || credentialWriteToolsAvailable(currentInput, &toolRuntime)) {
+				attempts := mergeCredentialWrites(credentialAttemptsForRun, credentialAttemptsFromGenerateOutput(output, &toolRuntime))
+				sanitizeGenerateOutputCredentialAttempts(output, attempts)
+			}
+			if err == nil && streamRequested {
+				generateErr = emitNonStreamingOutput(output)
+				if generateErr != nil {
+					return output, generateErr
+				}
+			}
+			if generateErr == nil {
+				usageAccumulator.finishCall(output != nil && hasObservedInputUsage(output.Usage))
+			}
+			return output, err
+		}
+		thinkingRouter := &thinkingDeltaRouter{}
+		callStreamUsage := llm.Usage{}
+		bufferCredentialOutput := shouldBufferCredentialStream(credentialAttemptedForRun)
+		credentialBuffer := credentialStreamBuffer{}
+		upstreamCallStarted = true
+		llmRequestCount++
+		handleStreamEvent := func(event llm.GenerateStreamEvent) error {
+			if currentInput.ResponsesBackground {
+				if responseID := strings.TrimSpace(event.ResponseID); responseID != "" {
+					responsesBackgroundRecovery.ResponseID = responseID
+				}
+			}
+			if s.isMessageGenerationCanceled(generationCtx, runID) {
+				return ErrMessageGenerationCanceled
+			}
+			if event.Usage != (llm.Usage{}) {
+				attemptHadSideEffect = true
+				// 上游流式 usage 通常是“本次 LLM 调用累计值”，但一条消息可能包含多轮 LLM 调用。
+				// 这里先换算成本次调用内增量，再累加成本轮消息总量，保证实时展示和最终账单口径一致。
+				usageDelta := diffLLMUsage(event.Usage, callStreamUsage)
+				callStreamUsage = event.Usage
+				if currentInput.ResponsesBackground {
+					responsesBackgroundRecovery.ObservedUsage = callStreamUsage
+				}
+				currentUsage := usageAccumulator.addObservedUsage(usageDelta)
+				if input.OnEvent != nil {
+					attemptObservation.markObservable()
+					if err := emitLLMUsageEvent(input.OnEvent, currentUsage); err != nil {
+						return err
+					}
+				}
+			}
+			if event.GeneratedImage != nil {
+				attemptHadSideEffect = true
+				if input.OnEvent != nil && strings.TrimSpace(event.GeneratedImage.B64JSON) != "" {
+					attemptObservation.markObservable()
+				}
+				if err := emitMediaImageDelta(input.OnEvent, event); err != nil {
+					return err
+				}
+			}
+			if event.Reasoning != nil && event.Reasoning.Text != "" {
+				attemptHadSideEffect = true
+			}
+			if traceRecorder != nil && event.Reasoning != nil && event.Reasoning.Text != "" {
+				if traceRecorder.visible() && traceRecorder.onEvent != nil {
+					attemptObservation.markObservable()
+				}
+				traceRecorder.appendUpstreamReasoning(event.Reasoning.Kind, event.Reasoning.Text, reasoningPayload(event.Reasoning))
+				if strings.EqualFold(strings.TrimSpace(event.Reasoning.Status), "completed") {
+					traceRecorder.completeUpstreamThink()
+				}
+			}
+			if event.ServerToolCall != nil {
+				attemptHadSideEffect = true
+			}
+			if traceRecorder != nil && event.ServerToolCall != nil {
+				if traceRecorder.visible() && traceRecorder.onEvent != nil {
+					attemptObservation.markObservable()
+				}
+				toolStatus := normalizeStreamServerToolStatus(event.ServerToolCall.Status)
+				summary, markdown, payload := buildToolTrace([]model.ToolCall{{
+					RunID:      runID,
+					ToolCallID: strings.TrimSpace(event.ServerToolCall.ToolCallID),
+					ToolType:   strings.TrimSpace(event.ServerToolCall.ToolType),
+					ToolName:   strings.TrimSpace(event.ServerToolCall.ToolName),
+					Status:     toolStatus,
+					InputJSON:  strings.TrimSpace(event.ServerToolCall.ArgumentsJSON),
+					OutputJSON: strings.TrimSpace(event.ServerToolCall.OutputJSON),
+					ErrorJSON:  strings.TrimSpace(event.ServerToolCall.ErrorJSON),
+				}})
+				traceRecorder.syncToolSection(summary, markdown, payload, traceStatusFromToolStatus(toolStatus))
+			}
+			if event.Delta == "" {
+				return nil
+			}
+			visibleDelta, thinkDelta := thinkingRouter.consume(event.Delta)
+			if thinkDelta != "" {
+				attemptHadSideEffect = true
+			}
+			if traceRecorder != nil && thinkDelta != "" {
+				if traceRecorder.visible() && traceRecorder.onEvent != nil {
+					attemptObservation.markObservable()
+				}
+				traceRecorder.appendUpstreamReasoning(messageTraceThinkKindContent, thinkDelta, nil)
+			}
+			if visibleDelta == "" {
+				return nil
+			}
+			return emitCallVisibleDelta(visibleDelta)
+		}
+		output, streamErr := s.llmClient.GenerateStream(generationCtx, routeConfig, currentInput, func(event llm.GenerateStreamEvent) error {
+			if !bufferCredentialOutput {
+				return handleStreamEvent(event)
+			}
+			immediate, hadSideEffect, bufferErr := credentialBuffer.add(event)
+			if hadSideEffect {
+				attemptHadSideEffect = true
+			}
+			if immediate.Usage != (llm.Usage{}) || strings.TrimSpace(immediate.ResponseID) != "" {
+				if err := handleStreamEvent(immediate); err != nil {
+					return err
+				}
+			} else if s.isMessageGenerationCanceled(generationCtx, runID) {
+				return ErrMessageGenerationCanceled
+			}
+			return bufferErr
+		})
+		if streamErr == nil && bufferCredentialOutput {
+			credentialAttempts := mergeCredentialWrites(credentialAttemptsForRun, credentialAttemptsFromGenerateOutput(output, &toolRuntime))
+			sanitizeGenerateOutputCredentialAttempts(output, credentialAttempts)
+			streamErr = flushCredentialBufferedStreamEvents(credentialBuffer.events, credentialAttempts, handleStreamEvent)
+		}
+		generateErr = streamErr
+		if generateErr == nil {
+			visibleTail, thinkTail := thinkingRouter.flush()
+			if traceRecorder != nil && thinkTail != "" {
+				traceRecorder.appendUpstreamReasoning(messageTraceThinkKindContent, thinkTail, nil)
+			}
+			if traceRecorder != nil && output != nil && output.Reasoning != nil {
+				traceRecorder.syncStructuredThink(
+					output.Reasoning.Text,
+					output.Reasoning.Summary,
+					reasoningPayload(&llm.ReasoningDelta{
+						EventType:        "response.completed",
+						ItemID:           output.Reasoning.ItemID,
+						Status:           output.Reasoning.Status,
+						Kind:             messageTraceThinkKindContent,
+						EncryptedContent: output.Reasoning.EncryptedContent,
+					}),
+				)
+			}
+			if traceRecorder != nil {
+				traceRecorder.completeUpstreamThink()
+			}
+			if visibleTail != "" {
+				if tailErr := emitCallVisibleDelta(visibleTail); tailErr != nil {
+					generateErr = tailErr
+				}
+			}
+			if output != nil {
+				output.Text = callVisibleText.String()
+			}
+		}
+		if !attemptHadSideEffect && llmRequestCount < maxLLMCalls &&
+			attemptObservation.canRetry(generateErr, shouldFallbackToNonStreaming) {
+			llmRequestCount++
+			output, generateErr = s.llmClient.Generate(generationCtx, routeConfig, currentInput)
+			if generateErr == nil && (credentialAttemptedForRun || credentialWriteToolsAvailable(currentInput, &toolRuntime)) {
+				attempts := mergeCredentialWrites(credentialAttemptsForRun, credentialAttemptsFromGenerateOutput(output, &toolRuntime))
+				sanitizeGenerateOutputCredentialAttempts(output, attempts)
+			}
+			if generateErr == nil {
+				generateErr = emitNonStreamingOutput(output)
+			}
+		}
+		if generateErr == nil {
+			usageAccumulator.finishCall(hasObservedInputUsage(callStreamUsage) || (output != nil && hasObservedInputUsage(output.Usage)))
+		}
+		return output, generateErr
+	}
+
+	handleCanceledGeneration := func(generateErr error) bool {
+		if generateErr == nil || (ctx.Err() == nil && !isMessageGenerationCanceledError(generateErr)) {
+			return false
+		}
+		retErr = ErrMessageGenerationCanceled
+		return true
+	}
+
+	runInitialRouteAttempt := func() (*llm.GenerateOutput, error) {
+		output, attemptErr := runGenerate(generateInput)
+		if !attemptHadSideEffect && llmRequestCount < maxLLMCalls && generateInput.ResponsesBackground &&
+			lastGenerationAttemptObservation.canRetry(attemptErr, shouldRetryWithoutResponsesBackground) {
+			if s.logger != nil {
+				s.logger.Warn("openai_responses_background_rejected_retry_standard",
+					zap.String("trace_id", traceid.FromContext(ctx)),
+					zap.Uint("conversation_id", input.ConversationID),
+					zap.String("protocol", route.Protocol),
+					zap.String("upstream_name", route.UpstreamName),
+					zap.Error(attemptErr),
+				)
+			}
+			generateInput.ResponsesBackground = false
+			responsesBackgroundRecovery = openAIResponsesBackgroundRecoveryState{}
+			output, attemptErr = runGenerate(generateInput)
+		}
+		if !attemptHadSideEffect && llmRequestCount < maxLLMCalls && strings.TrimSpace(generateInput.PreviousResponseID) != "" &&
+			lastGenerationAttemptObservation.canRetry(attemptErr, shouldRetryWithoutPreviousResponseID) {
+			if s.logger != nil {
+				s.logger.Warn("previous_response_id_rejected_retry_full_context",
+					zap.String("trace_id", traceid.FromContext(ctx)),
+					zap.Uint("conversation_id", input.ConversationID),
+					zap.String("protocol", route.Protocol),
+					zap.String("upstream_name", route.UpstreamName),
+					zap.Error(attemptErr),
+				)
+			}
+			_ = s.repo.UpdateConversationLastResponseID(ctx, input.ConversationID, "")
+			generateInput.PreviousResponseID = ""
+			generateInput.Messages = fullLLMMessages
+			applyOpenAIResponsesInstructions(route, routeConfig.Endpoint, &generateInput)
+			estimatedPromptTokens = estimateGenerateInputTokens(generateInput)
+			initialPromptShape = summarizePromptShape("full_retry", generateInput.Messages, fullLLMMessages, "")
+			if traceRecorder != nil {
+				traceRecorder.recordPromptTrace(buildMessagePromptTrace(messagePromptTraceInput{
+					Plan:              promptPlan.Trace,
+					Mode:              "full_retry",
+					PromptFingerprint: statefulPrefixFingerprint,
+					StatefulDecision: statefulResponseDecision{
+						DisabledReason: "previous_response_rejected",
+					},
+					SentMessages: generateInput.Messages,
+					FullMessages: fullLLMMessages,
+				}))
+			}
+			sendSpan.SetAttributes(promptShapeTraceAttributes("conversation.prompt_retry", initialPromptShape)...)
+			output, attemptErr = runGenerate(generateInput)
+		}
+		return output, attemptErr
+	}
+
+	var upstreamOutput *llm.GenerateOutput
+	upstreamOutput, err = runInitialRouteAttempt()
+	if handleCanceledGeneration(err) {
+		return nil, retErr
+	}
+	attemptedRouteIDs := []uint{route.RouteID}
+	routeFailureRecorded := false
+	for canFailoverMessageRoute(len(attemptedRouteIDs), llmRequestCount, maxLLMCalls, visibleDeltaCount, attemptHadSideEffect, err) {
+		failedRoute := route
+		failedErr := err
+		s.routeResolver.MarkRouteFailure(ctx, failedRoute, failedErr)
+		routeFailureRecorded = true
+
+		routeResolveInput.ExcludedRouteIDs = append([]uint(nil), attemptedRouteIDs...)
+		nextRoute, resolveErr := s.routeResolver.ResolveRoute(ctx, routeResolveInput)
+		if resolveErr != nil {
+			if s.logger != nil {
+				s.logger.Warn("upstream_route_failover_unavailable",
+					zap.String("trace_id", traceid.FromContext(ctx)),
+					zap.Uint("conversation_id", input.ConversationID),
+					zap.Uint("failed_route_id", failedRoute.RouteID),
+					zap.Error(resolveErr),
+				)
+			}
+			err = failedErr
+			break
+		}
+
+		route = nextRoute
+		attemptedRouteIDs = append(attemptedRouteIDs, route.RouteID)
+		routeFailureRecorded = false
+		nextPromptPlan, nextReasoningContentPassback, buildErr := buildRoutePrompt(route)
+		if buildErr != nil {
+			retErr = buildErr
+			return nil, buildErr
+		}
+		promptPlan = nextPromptPlan
+		reasoningContentPassback = nextReasoningContentPassback
+		llmMessages = promptPlan.Messages
+		applyRouteToRun(route)
+		routeConfig = messageRouteConfig(route, attributionReferer, attributionTitle)
+		responsesBackgroundRouteConfig = routeConfig
+		filteredOptions = filterModelOptions(input.Options, route.Protocol, modelOptionPolicyConfig{
+			Mode:                  cfg.ModelOptionPolicyMode,
+			AllowedPathsJSON:      cfg.ModelOptionAllowedPaths,
+			DeniedPathsJSON:       cfg.ModelOptionDeniedPaths,
+			ModelCapabilitiesJSON: route.ModelCapabilitiesJSON,
+		})
+		filteredOptions = withMessageRouteReasoningPassbackOptions(
+			filteredOptions,
+			input.Options,
+			route,
+			reasoningContentPassback,
+			llmMessages,
+		)
+		promptCacheKey, filteredOptions, llmMessages = configureOpenAIPromptCacheRequestForRoute(
+			route,
+			promptCacheSessionKey,
+			filteredOptions,
+			llmMessages,
+		)
+		fullLLMMessages = llmMessages
+		generateInput = llm.GenerateInput{
+			RequestID:              strings.TrimSpace(input.RequestID),
+			ConversationID:         input.ConversationID,
+			ConversationPublicID:   strings.TrimSpace(conversation.PublicID),
+			ConversationSessionKey: strings.TrimSpace(conversation.SessionKey),
+			PromptCacheKey:         promptCacheKey,
+			Messages:               cloneLLMMessages(llmMessages),
+			Tools:                  toolRuntime.definitions,
+			Options:                filteredOptions,
+		}
+		if supportsOpenAIResponsesBackgroundMode(route) {
+			generateInput.ResponsesBackground = true
+		}
+		applyOpenAIResponsesInstructions(route, routeConfig.Endpoint, &generateInput)
+		estimatedPromptTokens = estimateGenerateInputTokens(generateInput)
+		statefulPrefixFingerprint = buildPromptStateFingerprint(promptStateFingerprintInput{
+			Protocol:          route.Protocol,
+			Endpoint:          routeConfig.Endpoint,
+			UpstreamID:        route.UpstreamID,
+			UpstreamModel:     route.UpstreamModel,
+			PlatformModelName: conversation.Model,
+			ContextConfig:     statefulContextConfig,
+			ContextState:      statefulContextState,
+			Messages:          promptStatePrefixMessages(fullLLMMessages),
+			Tools:             toolRuntime.definitions,
+			Options:           filteredOptions,
+		})
+		initialPromptShape = summarizePromptShape("route_failover", generateInput.Messages, fullLLMMessages, "")
+		if traceRecorder != nil {
+			traceRecorder.recordPromptTrace(buildMessagePromptTrace(messagePromptTraceInput{
+				Plan:              promptPlan.Trace,
+				Mode:              "route_failover",
+				PromptFingerprint: statefulPrefixFingerprint,
+				StatefulDecision: statefulResponseDecision{
+					DisabledReason: "route_failover",
+				},
+				SentMessages: generateInput.Messages,
+				FullMessages: fullLLMMessages,
+			}))
+		}
+		sendSpan.SetAttributes(
+			attribute.Bool("conversation.route_failover", true),
+			attribute.Int("conversation.route_attempt", len(attemptedRouteIDs)),
+		)
+		attemptHadSideEffect = false
+		streamedText.Reset()
+		if s.logger != nil {
+			s.logger.Warn("upstream_route_failover",
+				zap.String("trace_id", traceid.FromContext(ctx)),
+				zap.Uint("conversation_id", input.ConversationID),
+				zap.Uint("failed_route_id", failedRoute.RouteID),
+				zap.Uint("next_route_id", route.RouteID),
+				zap.Int("attempt", len(attemptedRouteIDs)),
+				zap.Error(failedErr),
+			)
+		}
+		upstreamOutput, err = runInitialRouteAttempt()
+		if handleCanceledGeneration(err) {
+			return nil, retErr
+		}
+	}
+	if err != nil {
+		if !routeFailureRecorded {
+			s.routeResolver.MarkRouteFailure(ctx, route, err)
+		}
+		retErr = wrapUpstreamRequestError(err)
+		return nil, retErr
+	}
+	s.routeResolver.MarkRouteSuccess(ctx, route)
+
+	assistantText, nativeToolRows := syncUpstreamOutputTrace(traceRecorder, upstreamOutput, runID)
+	toolCallRows = append(toolCallRows, nativeToolRows...)
+	totalUsage := upstreamOutput.Usage
+	if totalUsage == (llm.Usage{}) {
+		totalUsage = usageAccumulator.usage()
+	} else {
+		usageAccumulator.setObservedUsage(totalUsage)
+	}
+	totalServerSideToolUsage = addServerSideToolUsage(nil, upstreamOutput.ServerSideToolUsage)
+	remainingToolCalls := s.resolveMaxToolCallsPerRun()
+	// windowCallCount 统计当前阶段窗口内已发生的 LLM 调用次数；阶段合并后重置，
+	// 保证"不扩大连续轮"：每个窗口的调用数仍受 maxLLMCalls 约束。
+	windowBaseCalls := 0
+	windowCallCount := llmRequestCount
+	toolLedger := newToolExecutionLedger()
+	toolHistoryTrimmedForRun := false
+
+	toolStageMerges := 0
+	const maxToolStageMergesPerRun = 4 // 阶段合并续轮安全上限：复杂任务最多额外开启 4 个工具窗口
+
+	// —— 阶段窗口循环 ——
+	// maxLLMCalls 只限制窗口内“连续”LLM 调用：连续预算耗尽且模型仍想调用工具时，
+	// 进入合并轮告知模型并让其总结进展、自主决定是否继续（新窗口重置预算），
+	// 直到模型产出最终回答。
+	for {
+		for len(upstreamOutput.ToolCalls) > 0 && windowCallCount < maxLLMCalls && remainingToolCalls > 0 {
+			pendingToolCalls := upstreamOutput.ToolCalls
+			if len(pendingToolCalls) > remainingToolCalls {
+				pendingToolCalls = pendingToolCalls[:remainingToolCalls]
+			}
+			reasoningContent := ""
+			if reasoningContentPassback {
+				reasoningContent = outputReasoningContent(upstreamOutput)
+			}
+			assistantToolMessage := llm.Message{
+				Role:             "assistant",
+				Content:          assistantText,
+				ReasoningContent: reasoningContent,
+				ToolCalls:        pendingToolCalls,
+			}
+			toolResultTokenBudget := resolveToolResultTokenBudget(
+				generateInput,
+				llmMessages,
+				assistantToolMessage,
+				route.UpstreamModel,
+				route.ModelCapabilitiesJSON,
+			)
+			toolCtx, toolSpan := platformtracing.Start(ctx, "conversation.tool.execute",
+				trace.WithAttributes(
+					attribute.Int64("conversation.id", int64(input.ConversationID)),
+					attribute.Int64("user.id", int64(input.UserID)),
+					attribute.Int("conversation.tool.request_count", len(upstreamOutput.ToolCalls)),
+					attribute.Int("conversation.tool.remaining_count", remainingToolCalls),
+					attribute.Int64("conversation.tool.result_token_budget", toolResultTokenBudget),
+				),
+			)
+			toolResult := s.executeAssistantToolCalls(toolCtx, executeAssistantToolCallsInput{
+				ProjectPublicID:         conversation.ProjectPublicID,
+				UserID:                  input.UserID,
+				ConversationID:          input.ConversationID,
+				MessageID:               assistantMessage.ID,
+				RequestID:               input.RequestID,
+				RunID:                   runID,
+				ToolCalls:               pendingToolCalls,
+				ToolCallLimit:           remainingToolCalls,
+				TraceRecorder:           traceRecorder,
+				ToolRuntime:             &toolRuntime,
+				ToolNameMap:             toolRuntime.nameMap,
+				MCPConfigs:              toolRuntime.mcpConfigs,
+				ToolSchemas:             toolRuntime.schemas,
+				PlatformTools:           toolRuntime.platformEntries,
+				Ledger:                  toolLedger,
+				PriorCredentialAttempts: credentialAttemptsForRun,
+				PriorCredentialWrites:   credentialWritesForRun,
+				ResultTokenBudget:       toolResultTokenBudget,
+			})
+			toolSpan.SetAttributes(
+				attribute.Int("conversation.tool.executed_count", len(toolResult.Rows)),
+				attribute.Int("conversation.tool.result_count", len(toolResult.ToolResults)),
+			)
+			if toolExecutionHasError(toolResult.Rows) {
+				toolSpan.SetStatus(codes.Error, "tool execution failed")
+			}
+			toolSpan.End()
+			totalMCPToolUsage = mergeMCPToolUsage(totalMCPToolUsage, toolResult.MCPToolUsage)
+			toolCallRows = append(toolCallRows, toolResult.Rows...)
+			mergeToolCallPersistenceKeys(&persistedToolCallKeys, toolResult.PersistedToolCallKeys)
+			remainingToolCalls = max(remainingToolCalls-countBudgetedToolCalls(toolResult.Rows), 0)
+			credentialAttempted := len(toolResult.CredentialAttempts) > 0
+			credentialStateChanged := len(toolResult.CredentialWrites) > 0
+			if credentialAttempted {
+				credentialAttemptedForRun = true
+				credentialAttemptsForRun = mergeCredentialWrites(credentialAttemptsForRun, toolResult.CredentialAttempts)
+				credentialWritesForRun = mergeCredentialWrites(credentialWritesForRun, toolResult.CredentialWrites)
+				// Scrub earlier snapshots before any error path can leave this run.
+				if err := s.persistMessageToolHistory(toolCtx, input.UserID, input.ConversationID, assistantMessage.ID, runID, llmMessages, credentialAttemptsForRun, credentialWritesForRun); err != nil {
+					retErr = err
+					return nil, err
+				}
+				if scrubErr := s.scrubPersistedToolCalls(toolCtx, input.UserID, input.ConversationID, runID, false, credentialAttemptsForRun, credentialWritesForRun); scrubErr != nil {
+					retErr = scrubErr
+					return nil, scrubErr
+				}
+				applyCredentialReplacementsToToolCallRows(toolCallRows, credentialAttemptsForRun, credentialWritesForRun)
+				assistantText, _ = applyCredentialReplacements(assistantText, toolResult.CredentialAttempts, toolResult.CredentialWrites)
+				assistantToolMessage.Content, _ = applyCredentialModelReplacements(assistantToolMessage.Content, toolResult.CredentialAttempts, toolResult.CredentialWrites)
+				assistantToolMessage.ReasoningContent, _ = applyCredentialModelReplacements(assistantToolMessage.ReasoningContent, toolResult.CredentialAttempts, toolResult.CredentialWrites)
+				applyCredentialModelReplacementsToLLMMessages(fullLLMMessages, toolResult.CredentialAttempts, toolResult.CredentialWrites)
+				applyCredentialModelReplacementsToLLMMessages(llmMessages, toolResult.CredentialAttempts, toolResult.CredentialWrites)
+				if traceRecorder != nil {
+					traceRecorder.scrubCredentialAttempts(toolCtx, toolResult.CredentialAttempts, toolResult.CredentialWrites)
+				}
+				_ = s.repo.UpdateConversationLastResponseID(ctx, input.ConversationID, "")
+			}
+			if credentialStateChanged {
+				if _, updateErr := s.applyCredentialWritesToUserMessage(toolCtx, userMessage, input.ConversationID, input.UserID, toolResult.CredentialWrites); updateErr != nil {
+					retErr = updateErr
+					return nil, updateErr
+				}
+				input.Content, _ = applyCredentialWrites(input.Content, toolResult.CredentialWrites)
+			}
+			if toolResult.MCPActivationChanged {
+				toolRuntime = toolRuntime.visibleRuntime()
+				if !toolRuntime.multimodalAnalyzerHandlesCurrentAttachments() && toolRuntime.attachmentProcessorActive() {
+					// 激活后的自动附件处理属于系统配套动作，不消耗模型显式工具调用预算。
+					attachmentToolCallLimit := len(processorAttachments)
+					activatedProcessing, processingErr := s.processImageAttachments(toolCtx, imageAttachmentProcessingInput{
+						UserID:            input.UserID,
+						ConversationID:    input.ConversationID,
+						MessageID:         assistantMessage.ID,
+						RequestID:         input.RequestID,
+						RunID:             runID,
+						UserPrompt:        input.Content,
+						Attachments:       processorAttachments,
+						AttachmentImports: attachmentImports,
+						Runtime:           toolRuntime,
+						TraceRecorder:     traceRecorder,
+						ToolCallLimit:     &attachmentToolCallLimit,
+					})
+					totalMCPToolUsage = mergeMCPToolUsage(totalMCPToolUsage, activatedProcessing.MCPToolUsage)
+					if processingErr != nil {
+						retErr = processingErr
+						return nil, processingErr
+					}
+					if activatedProcessing.Routed {
+						mergeImageAttachmentProcessingResult(&imageProcessing, activatedProcessing)
+						toolCallRows = append(toolCallRows, activatedProcessing.Rows...)
+						mergeToolCallPersistenceKeys(&persistedToolCallKeys, activatedProcessing.PersistedToolCallKeys)
+						appendAttachmentAnalysesToActivationResult(toolResult.ToolResults, activatedProcessing.Analyses, toolResultTokenBudget)
+						toolRuntime = toolRuntime.withoutAttachmentProcessor()
+					}
+				}
+			}
+			if toolResult.FatalErr != nil {
+				retErr = wrapUpstreamRequestError(toolResult.FatalErr)
+				return nil, retErr
+			}
+			if len(toolResult.ToolResults) == 0 {
+				break
+			}
+			assistantToolMessage.ToolCalls = toolResult.ExecutedToolCalls
+			llmMessages = append(llmMessages,
+				assistantToolMessage,
+				llm.Message{
+					Role:        "tool",
+					ToolResults: toolResult.ToolResults,
+				},
+			)
+			var toolHistoryTrimmed bool
+			llmMessages, toolHistoryTrimmed = trimToolFollowUpHistory(
+				generateInput,
+				llmMessages,
+				route.UpstreamModel,
+				route.ModelCapabilitiesJSON,
+			)
+			if toolHistoryTrimmed {
+				toolHistoryTrimmedForRun = true
+				sendSpan.SetAttributes(attribute.Bool("conversation.tool.history_trimmed", true))
+			}
+			var toolResultsRebalanced bool
+			llmMessages, toolResultsRebalanced = rebalanceToolFollowUpResults(
+				generateInput,
+				llmMessages,
+				route.UpstreamModel,
+				route.ModelCapabilitiesJSON,
+			)
+			if toolResultsRebalanced {
+				sendSpan.SetAttributes(attribute.Bool("conversation.tool.results_rebalanced", true))
+			}
+			if err := s.persistMessageToolHistory(ctx, input.UserID, input.ConversationID, assistantMessage.ID, runID, llmMessages, credentialAttemptsForRun, credentialWritesForRun); err != nil {
+				retErr = err
+				return nil, err
+			}
+
+			if windowCallCount+1 >= maxLLMCalls {
+				// 连续窗口预算耗尽：不再发起强制收尾轮。本轮工具结果已并入上下文，
+				// 退出内层循环进入合并轮，由模型总结进展并自主决定是否继续（新窗口重置预算）。
+				break
+			}
+			followUpInput := generateInput
+			followUpInput.Tools = toolRuntime.definitions
+			followUpInput.DisableTools = false
+			if !credentialAttempted && !toolResult.MCPActivationChanged && !toolHistoryTrimmed && !toolResultsRebalanced && routeConfig.Endpoint == llm.EndpointResponses && supportsPreviousResponseIDRoute(route) && strings.TrimSpace(upstreamOutput.ResponseID) != "" {
+				followUpInput.PreviousResponseID = strings.TrimSpace(upstreamOutput.ResponseID)
+				followUpInput.Messages = []llm.Message{{Role: "tool", ToolResults: toolResult.ToolResults}}
+			} else {
+				followUpInput.Messages = llmMessages
+				followUpInput.PreviousResponseID = ""
+				applyOpenAIResponsesInstructions(route, routeConfig.Endpoint, &followUpInput)
+			}
+
+			nextOutput, nextErr := runGenerate(followUpInput)
+			if handleCanceledGeneration(nextErr) {
+				return nil, retErr
+			}
+			if nextErr != nil {
+				s.routeResolver.MarkRouteFailure(ctx, route, nextErr)
+				retErr = wrapUpstreamRequestError(nextErr)
+				return nil, retErr
+			}
+			s.routeResolver.MarkRouteSuccess(ctx, route)
+			totalUsage = addLLMUsage(totalUsage, nextOutput.Usage)
+			if nextOutput.Usage != (llm.Usage{}) {
+				usageAccumulator.setObservedUsage(totalUsage)
+			} else if usageAccumulator.usage() != (llm.Usage{}) {
+				totalUsage = usageAccumulator.usage()
+			}
+			totalServerSideToolUsage = addServerSideToolUsage(totalServerSideToolUsage, nextOutput.ServerSideToolUsage)
+			upstreamOutput = nextOutput
+			windowCallCount = llmRequestCount - windowBaseCalls
+			var nextNativeToolRows []model.ToolCall
+			assistantText, nextNativeToolRows = syncUpstreamOutputTrace(traceRecorder, upstreamOutput, runID)
+			toolCallRows = append(toolCallRows, nextNativeToolRows...)
+		}
+		if len(upstreamOutput.ToolCalls) > 0 && remainingToolCalls <= 0 && windowCallCount < maxLLMCalls {
+			finalInput := generateInput
+			finalInput.Messages = buildFinalToolSynthesisMessages(llmMessages, "The maximum number of tool calls for this run has been reached. Stop calling tools and produce the final answer based on the tool results already available. If the information is insufficient, state the missing information directly.")
+			finalInput.Tools = nil
+			finalInput.DisableTools = true
+			finalInput.PreviousResponseID = ""
+			applyOpenAIResponsesInstructions(route, routeConfig.Endpoint, &finalInput)
+			nextOutput, nextErr := runGenerate(finalInput)
+			if handleCanceledGeneration(nextErr) {
+				return nil, retErr
+			}
+			if nextErr != nil {
+				s.routeResolver.MarkRouteFailure(ctx, route, nextErr)
+				retErr = wrapUpstreamRequestError(nextErr)
+				return nil, retErr
+			}
+			s.routeResolver.MarkRouteSuccess(ctx, route)
+			totalUsage = addLLMUsage(totalUsage, nextOutput.Usage)
+			if nextOutput.Usage != (llm.Usage{}) {
+				usageAccumulator.setObservedUsage(totalUsage)
+			} else if usageAccumulator.usage() != (llm.Usage{}) {
+				totalUsage = usageAccumulator.usage()
+			}
+			totalServerSideToolUsage = addServerSideToolUsage(totalServerSideToolUsage, nextOutput.ServerSideToolUsage)
+			upstreamOutput = nextOutput
+			windowCallCount = llmRequestCount - windowBaseCalls
+			var nextNativeToolRows []model.ToolCall
+			assistantText, nextNativeToolRows = syncUpstreamOutputTrace(traceRecorder, upstreamOutput, runID)
+			toolCallRows = append(toolCallRows, nextNativeToolRows...)
+		}
+
+		// 请求式披露：模型通过 <read_file> 标记请求技能包内文件内容。
+		// 标记已在流式输出中被剥离；此处读取文件内容并追加 system 消息后再次调用模型（无工具），
+		// 每个阶段窗口内最多补充一轮。第二轮输出中的标记同样被剥离且不再补充。
+		if len(lastReadFileRequests) > 0 && windowCallCount < maxLLMCalls {
+			fileMessages, loadedPaths := s.resolveSkillFileRequests(ctx, input.UserID, skillPrompts, lastReadFileRequests)
+			if len(fileMessages) > 0 {
+				followUpInput := generateInput
+				followUpInput.Messages = append(cloneLLMMessages(llmMessages), fileMessages...)
+				followUpInput.Tools = nil
+				followUpInput.DisableTools = true
+				followUpInput.PreviousResponseID = ""
+				applyOpenAIResponsesInstructions(route, routeConfig.Endpoint, &followUpInput)
+				fileOutput, fileErr := runGenerate(followUpInput)
+				if handleCanceledGeneration(fileErr) {
+					return nil, retErr
+				}
+				if fileErr == nil && fileOutput != nil {
+					totalUsage = addLLMUsage(totalUsage, fileOutput.Usage)
+					if fileOutput.Usage != (llm.Usage{}) {
+						usageAccumulator.setObservedUsage(totalUsage)
+					} else if usageAccumulator.usage() != (llm.Usage{}) {
+						totalUsage = usageAccumulator.usage()
+					}
+					totalServerSideToolUsage = addServerSideToolUsage(totalServerSideToolUsage, fileOutput.ServerSideToolUsage)
+					if text := strings.TrimSpace(fileOutput.Text); text != "" {
+						if strings.TrimSpace(assistantText) != "" {
+							assistantText = strings.TrimSpace(assistantText) + "\n\n" + text
+						} else {
+							assistantText = text
+						}
+					}
+					windowCallCount = llmRequestCount - windowBaseCalls
+				} else if fileErr != nil {
+					// 补充轮失败不影响已生成内容；记录但不 failover（首轮已成功）。
+					if s.logger != nil {
+						s.logger.Warn("skill_file_followup_failed",
+							zap.String("trace_id", traceid.FromContext(ctx)),
+							zap.Uint("conversation_id", input.ConversationID),
+							zap.Int("requested_files", len(lastReadFileRequests)),
+							zap.Int("loaded_files", len(loadedPaths)),
+							zap.Error(fileErr),
+						)
+					}
+				}
+			}
+			if traceRecorder != nil && len(loadedPaths) > 0 {
+				traceRecorder.appendProcessSection(
+					fmt.Sprintf("已读取 %d 个技能包文件", len(loadedPaths)),
+					formatTraceStep("Skill 文件", fmt.Sprintf("根据 <read_file> 请求补充注入 %d 个文件内容：%s。", len(loadedPaths), strings.Join(loadedPaths, "、"))),
+					&tracePayload{
+						TraceStage: &traceStage{
+							Kind:   "skill_context",
+							Status: messageTraceStatusStreaming,
+						},
+						SkillFileRead:  len(loadedPaths),
+						SkillFilePaths: loadedPaths,
+					},
+					messageTraceStatusStreaming,
+				)
+			}
+			// 已处理的文件请求移出队列，避免后续窗口重复加载。
+			lastReadFileRequests = nil
+		}
+
+		// 内层循环在“下一轮调用将耗尽连续窗口预算”时提前退出（未发起该轮调用），
+		// 因此预算判断按 windowCallCount+1 计算：耗尽即进入合并轮告知模型，
+		// 由模型自主决定继续（新窗口重置预算）或收尾，不再降级接受残留的半截文本。
+		if !toolRunFinalAnswerMissing(upstreamOutput, len(toolCallRows) > 0, windowCallCount+1, maxLLMCalls, remainingToolCalls) {
+			break
+		}
+		if toolStageMerges >= maxToolStageMergesPerRun {
+			break
+		}
+		toolStageMerges++
+
+		// —— 阶段合并：禁用工具让模型总结已获取信息与剩余工作，随后开启新预算窗口继续。 ——
+		mergeInput := generateInput
+		mergeInput.Messages = append(cloneLLMMessages(llmMessages), llm.Message{Role: "system", Content: buildToolStageMergeInstruction()})
+		mergeInput.Tools = nil
+		mergeInput.DisableTools = true
+		mergeInput.PreviousResponseID = ""
+		applyOpenAIResponsesInstructions(route, routeConfig.Endpoint, &mergeInput)
+		silentDelta := onDelta
+		onDelta = nil // 阶段总结只注入上下文与轨迹，不流入可见回答
+		mergeOutput, mergeErr := runGenerate(mergeInput)
+		onDelta = silentDelta
+		if handleCanceledGeneration(mergeErr) {
+			return nil, retErr
+		}
+		if mergeErr != nil {
+			s.routeResolver.MarkRouteFailure(ctx, route, mergeErr)
+			retErr = wrapUpstreamRequestError(mergeErr)
+			return nil, retErr
+		}
+		s.routeResolver.MarkRouteSuccess(ctx, route)
+		totalUsage = addLLMUsage(totalUsage, mergeOutput.Usage)
+		if mergeOutput.Usage != (llm.Usage{}) {
+			usageAccumulator.setObservedUsage(totalUsage)
+		} else if usageAccumulator.usage() != (llm.Usage{}) {
+			totalUsage = usageAccumulator.usage()
+		}
+		totalServerSideToolUsage = addServerSideToolUsage(totalServerSideToolUsage, mergeOutput.ServerSideToolUsage)
+		mergeText := strings.TrimSpace(mergeOutput.Text)
+		if mergeText == "" && !mergeOutput.TextToolCallsStripped {
+			// 模型在禁用工具轮既没有文本也没有任何工具意图：无法收尾，放弃。
+			break
+		}
+		if mergeText == "" {
+			// 模型在禁用工具轮仍输出被剥离的 DSML 工具块（DeepSeek 习惯行为）。
+			// 先给一次明确的收尾引导：若模型已能收尾（例如读图失败时请求用户
+			// 提供文字信息），直接产出文本；若仍坚持调用工具，才开启新工具窗口。
+			finalizeInput := generateInput
+			finalizeInput.Messages = append(cloneLLMMessages(llmMessages), llm.Message{Role: "system", Content: buildToolStageFinalizeInstruction()})
+			finalizeInput.Tools = nil
+			finalizeInput.DisableTools = true
+			finalizeInput.PreviousResponseID = ""
+			applyOpenAIResponsesInstructions(route, routeConfig.Endpoint, &finalizeInput)
+			silentDelta = onDelta
+			onDelta = nil // 收尾引导轮只产出最终回答，不流入可见中间输出
+			finalizeOutput, finalizeErr := runGenerate(finalizeInput)
+			onDelta = silentDelta
+			if handleCanceledGeneration(finalizeErr) {
+				return nil, retErr
+			}
+			if finalizeErr != nil {
+				s.routeResolver.MarkRouteFailure(ctx, route, finalizeErr)
+				retErr = wrapUpstreamRequestError(finalizeErr)
+				return nil, retErr
+			}
+			s.routeResolver.MarkRouteSuccess(ctx, route)
+			totalUsage = addLLMUsage(totalUsage, finalizeOutput.Usage)
+			if finalizeOutput.Usage != (llm.Usage{}) {
+				usageAccumulator.setObservedUsage(totalUsage)
+			} else if usageAccumulator.usage() != (llm.Usage{}) {
+				totalUsage = usageAccumulator.usage()
+			}
+			totalServerSideToolUsage = addServerSideToolUsage(totalServerSideToolUsage, finalizeOutput.ServerSideToolUsage)
+			finalizeText := strings.TrimSpace(finalizeOutput.Text)
+			if finalizeText != "" {
+				// 模型完成收尾（如说明缺失信息并请求用户补充）：直接作为最终回答结束，
+				// 不再开启新窗口。
+				upstreamOutput = finalizeOutput
+				var nextNativeToolRows []model.ToolCall
+				assistantText, nextNativeToolRows = syncUpstreamOutputTrace(traceRecorder, upstreamOutput, runID)
+				toolCallRows = append(toolCallRows, nextNativeToolRows...)
+				break
+			}
+			if finalizeOutput.TextToolCallsStripped {
+				// 模型仍坚持调用工具：视为继续意图，开启新工具窗口让其继续。
+				if traceRecorder != nil {
+					traceRecorder.appendProcessSection(
+						"工具预算已耗尽且模型仍想继续调用工具，自动开启新一轮",
+						formatTraceStep("阶段合并", "模型连续在禁用工具轮输出工具调用语法，系统按继续意图开启新窗口。"),
+						&tracePayload{
+							TraceStage: &traceStage{
+								Kind:   "stage_merge",
+								Status: messageTraceStatusCompleted,
+							},
+							StageMergeRound:    toolStageMerges,
+							StrippedToolIntent: true,
+							AutoContinueWindow: true,
+						},
+						messageTraceStatusCompleted,
+					)
+				}
+			} else {
+				break
+			}
+		} else {
+			mergeText = headTailToolOutput(mergeText, 1600)
+			llmMessages = append(llmMessages, llm.Message{
+				Role:    "system",
+				Content: fmt.Sprintf("【阶段性进展（第 %d 轮）】\n%s", toolStageMerges, mergeText),
+			})
+			if traceRecorder != nil {
+				traceRecorder.appendProcessSection(
+					fmt.Sprintf("阶段性总结（第 %d 轮）：工具预算已耗尽，模型整理进展后开启新一轮", toolStageMerges),
+					formatTraceStep("阶段合并", mergeText),
+					&tracePayload{
+						TraceStage: &traceStage{
+							Kind:   "stage_merge",
+							Status: messageTraceStatusCompleted,
+						},
+						StageMergeRound: toolStageMerges,
+					},
+					messageTraceStatusCompleted,
+				)
+			}
+		}
+		// 开启新窗口：重置窗口内调用计数与工具额度，随后发起一次普通调用让模型继续工作。
+		windowBaseCalls = llmRequestCount
+		windowCallCount = 0
+		remainingToolCalls = s.resolveMaxToolCallsPerRun()
+		continueInput := generateInput
+		continueInput.Messages = llmMessages
+		continueInput.PreviousResponseID = ""
+		applyOpenAIResponsesInstructions(route, routeConfig.Endpoint, &continueInput)
+		nextOutput, nextErr := runGenerate(continueInput)
+		if handleCanceledGeneration(nextErr) {
+			return nil, retErr
+		}
+		if nextErr != nil {
+			s.routeResolver.MarkRouteFailure(ctx, route, nextErr)
+			retErr = wrapUpstreamRequestError(nextErr)
+			return nil, retErr
+		}
+		s.routeResolver.MarkRouteSuccess(ctx, route)
+		totalUsage = addLLMUsage(totalUsage, nextOutput.Usage)
+		if nextOutput.Usage != (llm.Usage{}) {
+			usageAccumulator.setObservedUsage(totalUsage)
+		} else if usageAccumulator.usage() != (llm.Usage{}) {
+			totalUsage = usageAccumulator.usage()
+		}
+		totalServerSideToolUsage = addServerSideToolUsage(totalServerSideToolUsage, nextOutput.ServerSideToolUsage)
+		upstreamOutput = nextOutput
+		windowCallCount = llmRequestCount - windowBaseCalls
+		var nextNativeToolRows []model.ToolCall
+		assistantText, nextNativeToolRows = syncUpstreamOutputTrace(traceRecorder, upstreamOutput, runID)
+		toolCallRows = append(toolCallRows, nextNativeToolRows...)
+	}
+
+	effectiveInputTokens := usageAccumulator.effectiveInputTokens(estimatedPromptTokens)
+	effectiveOutputTokens := resolveObservedOrEstimatedOutputTokens(totalUsage.OutputTokens, assistantText)
+
+	if toolRunFinalAnswerMissing(upstreamOutput, len(toolCallRows) > 0, windowCallCount+1, maxLLMCalls, remainingToolCalls) &&
+		strings.TrimSpace(assistantText) == "" && len(upstreamOutput.GeneratedImages) == 0 {
+		retErr = ErrToolRunFinalAnswerMissing
+		return nil, retErr
+	}
+	if strings.TrimSpace(assistantText) == "" && len(upstreamOutput.GeneratedImages) == 0 {
+		retErr = ErrUpstreamEmptyResponse
+		return nil, retErr
+	}
+	finalUsageEvent := totalUsage
+	finalUsageEvent.InputTokens = effectiveInputTokens
+	finalUsageEvent.OutputTokens = effectiveOutputTokens
+	if err := emitLLMUsageEvent(input.OnEvent, finalUsageEvent); err != nil {
+		retErr = err
+		return nil, err
+	}
+	assistantReasoningContent := ""
+	if reasoningContentPassback {
+		assistantReasoningContent = outputReasoningContent(upstreamOutput)
+	}
+	if credentialAttemptedForRun {
+		assistantText, _ = applyCredentialReplacements(assistantText, credentialAttemptsForRun, credentialWritesForRun)
+		assistantReasoningContent, _ = applyCredentialReplacements(assistantReasoningContent, credentialAttemptsForRun, credentialWritesForRun)
+		if traceRecorder != nil {
+			traceRecorder.scrubCredentialAttempts(ctx, credentialAttemptsForRun, credentialWritesForRun)
+		}
+	}
+	statefulPromptFingerprint := buildPromptStateFingerprint(promptStateFingerprintInput{
+		Protocol:          route.Protocol,
+		Endpoint:          routeConfig.Endpoint,
+		UpstreamID:        route.UpstreamID,
+		UpstreamModel:     route.UpstreamModel,
+		PlatformModelName: conversation.Model,
+		ContextConfig:     statefulContextConfig,
+		ContextState:      statefulContextState,
+		Messages:          buildNextStatefulPrefixMessages(llmMessages, input.Content, assistantText, assistantReasoningContent),
+		Tools:             toolRuntime.definitions,
+		Options:           filteredOptions,
+	})
+	if err := s.persistMessageToolHistory(ctx, input.UserID, input.ConversationID, assistantMessage.ID, runID, llmMessages, credentialAttemptsForRun, credentialWritesForRun); err != nil {
+		retErr = err
+		return nil, err
+	}
+	responseIDForPersistence := upstreamOutput.ResponseID
+	// MCP 工具 schema 和凭据明文所在的 provider state 都不能泄漏到下一条消息。
+	if len(toolRuntime.mcpActivation.activeServerIDs()) > 0 || credentialAttemptedForRun {
+		responseIDForPersistence = ""
+		statefulPromptFingerprint = ""
+	}
+	// 历史裁剪后的上游 response 不再代表数据库可重建的完整历史，禁止跨轮复用。
+	if toolHistoryTrimmedForRun {
+		responseIDForPersistence = ""
+		statefulPromptFingerprint = ""
+	}
+
+	run.InputTokens = effectiveInputTokens
+	run.OutputTokens = effectiveOutputTokens
+	run.CacheReadTokens = totalUsage.CacheReadTokens
+	run.CacheWriteTokens = totalUsage.CacheWriteTokens
+	run.ReasoningTokens = totalUsage.ReasoningTokens
+	run.ToolCallsCount = len(toolCallRows)
+	run.FirstTokenLatencyMS = firstVisibleDeltaLatencyMS
+	if run.FirstTokenLatencyMS == 0 {
+		run.FirstTokenLatencyMS = time.Since(startedAt).Milliseconds()
+	}
+	if run.FirstTokenLatencyMS < 0 {
+		run.FirstTokenLatencyMS = 0
+	}
+	if s.logger != nil {
+		fields := []zap.Field{
+			zap.String("trace_id", traceid.FromContext(ctx)),
+			zap.Uint("conversation_id", input.ConversationID),
+			zap.String("protocol", route.Protocol),
+			zap.String("upstream_name", route.UpstreamName),
+			zap.Int64("input_tokens", totalUsage.InputTokens),
+			zap.Int64("cache_read_tokens", totalUsage.CacheReadTokens),
+			zap.Int64("cache_write_tokens", totalUsage.CacheWriteTokens),
+			zap.Int64("output_tokens", totalUsage.OutputTokens),
+			zap.Int("visible_delta_count", visibleDeltaCount),
+			zap.Int64("first_visible_delta_latency_ms", firstVisibleDeltaLatencyMS),
+		}
+		fields = append(fields, promptShapeLogFields(initialPromptShape)...)
+		s.logger.Debug("conversation_prompt_shape", fields...)
+	}
+
+	assistantLatencyMS := time.Since(startedAt).Milliseconds()
+	if assistantLatencyMS < 0 {
+		assistantLatencyMS = 0
+	}
+	persistCtx, persistSpan := platformtracing.Start(ctx, "conversation.persist",
+		trace.WithAttributes(
+			attribute.Int64("conversation.id", int64(input.ConversationID)),
+			attribute.Int64("user.message_id", int64(userMessage.ID)),
+			attribute.Int64("assistant.message_id", int64(assistantMessage.ID)),
+			attribute.Int("conversation.tool_count", len(toolCallRows)),
+		),
+	)
+	err = s.persistSuccessfulMessageGeneration(persistCtx, persistMessageGenerationInput{
+		SendInput:                 input,
+		Conversation:              conversation,
+		UserMessage:               userMessage,
+		AssistantMessage:          assistantMessage,
+		AssistantText:             assistantText,
+		AssistantReasoningContent: assistantReasoningContent,
+		GeneratedImages:           upstreamOutput.GeneratedImages,
+		InputTokens:               effectiveInputTokens,
+		CacheReadTokens:           totalUsage.CacheReadTokens,
+		CacheWriteTokens:          totalUsage.CacheWriteTokens,
+		OutputTokens:              effectiveOutputTokens,
+		ReasoningTokens:           totalUsage.ReasoningTokens,
+		AssistantLatency:          assistantLatencyMS,
+		ResponseID:                responseIDForPersistence,
+		StatefulPromptFingerprint: statefulPromptFingerprint,
+		ToolCallRows:              toolCallRows,
+		PersistedToolCallKeys:     persistedToolCallKeys,
+		Route:                     resolvedRoute,
+		TraceRecorder:             traceRecorder,
+		ReuseUserMessage:          reuseUserMessage,
+		SkipUserMessageEmbedding:  credentialAttemptedForRun,
+		SkipEmbed:                 moderationCoord != nil,
+	})
+	platformtracing.RecordError(persistSpan, err)
+	persistSpan.End()
+	if err != nil {
+		retErr = err
+		return nil, err
+	}
+
+	compactMessages := append([]model.Message(nil), contextMessages...)
+	compactMessages[len(compactMessages)-1] = *userMessage
+	compactMessages = append(compactMessages, *assistantMessage)
+	compactCfg := s.cfg.Snapshot()
+	compactPolicy = s.resolveContextCompactionPolicy(ctx, compactCfg, input.UserID)
+	if credentialAttemptedForRun {
+		compactPolicy.AdminEnabled = false
+	}
+	compactInput := appcompact.MaybeCompactConversationInput{
+		ConversationID:      input.ConversationID,
+		UserID:              input.UserID,
+		RunID:               runID,
+		Messages:            compactMessages,
+		PromptTokenEstimate: estimatedPromptTokens,
+	}
+	var postBillingCompaction *postBillingCompactionTask
+	if !compactPolicy.EffectiveEnabled() {
+		// 用户已关闭自动压缩，仅完成 trace 记录
+		if traceRecorder != nil {
+			traceRecorder.complete()
+			traceRecorder.attachToMessage(assistantMessage)
+		}
+	} else {
+		compactPlatformModelName := s.resolveTextTaskModel(ctx, textTaskRouteInput{
+			ConfiguredModel:   compactCfg.CompactTaskModel,
+			ConversationModel: conversation.Model,
+			UserID:            input.UserID,
+			ConversationID:    input.ConversationID,
+			RequestID:         strings.TrimSpace(input.RequestID),
+		})
+		compactInput.PlatformModelName = compactPlatformModelName
+		postBillingCompaction = &postBillingCompactionTask{
+			Async:          compactCfg.CompactAsyncEnabled,
+			Input:          compactInput,
+			ConversationID: input.ConversationID,
+			UserID:         input.UserID,
+			MessageID:      assistantMessage.ID,
+			RunID:          runID,
+			PreserveTurns:  compactCfg.ContextCompactPreserve,
+			OnEvent:        input.OnEvent,
+			TraceRecorder:  traceRecorder,
+		}
+		if compactCfg.CompactAsyncEnabled && traceRecorder != nil {
+			traceRecorder.complete()
+			traceRecorder.attachToMessage(assistantMessage)
+			postBillingCompaction.TraceRecorder = nil
+			postBillingCompaction.OnEvent = nil
+		}
+	}
+
+	// 流式路径：trace 已由 traceRecorder.attachToMessage 从内存填充；
+	// 新消息 feedback 必为 0，两次 DB 读无意义，跳过以消除 completed 事件前的最后阻塞。
+	if !preferStream {
+		feedbackMessages := []model.Message{*userMessage, *assistantMessage}
+		if err = s.hydrateMessages(ctx, input.UserID, feedbackMessages); err == nil {
+			_ = s.hydrateMessageProcessTraces(ctx, feedbackMessages)
+			*userMessage = feedbackMessages[0]
+			*assistantMessage = feedbackMessages[1]
+		}
+	}
+
+	metadataRefreshHint := conversationMetadataRefreshNotNeeded
+	if !credentialAttemptedForRun {
+		s.persistInitialConversationFallbackTitle(ctx, *conversation, *userMessage)
+		metadataRefreshHint = s.resolveConversationMetadataRefreshHint(ctx, *conversation, *userMessage)
+	}
+
+	result = &SendMessageResult{
+		UserMessage:           *userMessage,
+		AssistantMessage:      *assistantMessage,
+		MetadataRefreshHint:   metadataRefreshHint,
+		Billable:              true,
+		UpstreamID:            run.UpstreamID,
+		UpstreamName:          run.UpstreamName,
+		IsUserOwnedUpstream:   route.UpstreamOwnerUserID != nil,
+		UpstreamOwnerUserID:   route.UpstreamOwnerUserID,
+		UpstreamBillingMode:   route.UpstreamBillingMode,
+		PlatformModelName:     route.PlatformModelName,
+		RoutedBindingCode:     route.BindingCode,
+		UpstreamModelName:     route.UpstreamModel,
+		UpstreamProtocol:      route.Protocol,
+		EffectiveOptions:      filteredOptions,
+		UsageSpeed:            totalUsage.Speed,
+		UsageServiceTier:      totalUsage.ServiceTier,
+		RawUsageJSON:          totalUsage.RawUsageJSON,
+		CacheWrite5mTokens:    totalUsage.CacheWrite5mTokens,
+		CacheWrite1hTokens:    totalUsage.CacheWrite1hTokens,
+		ServerSideToolUsage:   totalServerSideToolUsage,
+		MCPToolUsage:          totalMCPToolUsage,
+		LatencyMS:             time.Since(startedAt).Milliseconds(),
+		StartedAt:             startedAt,
+		postBillingCompaction: postBillingCompaction,
+	}
+	// Soft moderation barrier: show checking, then block or pass.
+	if moderationCoord != nil {
+		outputImages := s.loadOutputImagesForModeration(ctx, moderationCoord, input.UserID, assistantMessage.Attachments)
+		s.completeModerationAfterSuccess(
+			ctx,
+			moderationCoord,
+			result,
+			moderationOutputText(assistantText, assistantReasoningContent, traceRecorder.upstreamThinkContent()),
+			outputImages,
+			input,
+			reuseUserMessage,
+		)
+	}
+	return result, nil
+}
+
+func messageKnowledgeSourcesFromRAGChunks(chunks []model.RAGChunk) []model.MessageKnowledgeSource {
+	if len(chunks) == 0 {
+		return nil
+	}
+	sources := make([]model.MessageKnowledgeSource, 0, len(chunks))
+	for _, chunk := range chunks {
+		sources = append(sources, model.MessageKnowledgeSource{
+			FileName:   strings.TrimSpace(chunk.FileName),
+			FileID:     strings.TrimSpace(chunk.FileID),
+			ChunkIndex: chunk.ChunkIndex,
+			Score:      chunk.Score,
+			Preview:    textutil.CompactSnippet(chunk.Content, 100),
+			Modality:   chunk.Modality,
+		})
+	}
+	return sources
+}
+

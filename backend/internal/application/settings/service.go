@@ -1,0 +1,1245 @@
+package settings
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strconv"
+	"strings"
+
+	appaudit "github.com/DEEIX-AI/DEEIX-Chat/backend/internal/application/audit"
+	"github.com/DEEIX-AI/DEEIX-Chat/backend/internal/application/extraction"
+	domainbilling "github.com/DEEIX-AI/DEEIX-Chat/backend/internal/domain/billing"
+	domainsettings "github.com/DEEIX-AI/DEEIX-Chat/backend/internal/domain/settings"
+	"github.com/DEEIX-AI/DEEIX-Chat/backend/internal/infra/config"
+	extractport "github.com/DEEIX-AI/DEEIX-Chat/backend/internal/ports/extract"
+	"github.com/DEEIX-AI/DEEIX-Chat/backend/internal/repository"
+	"github.com/DEEIX-AI/DEEIX-Chat/backend/internal/shared/security"
+)
+
+// Service 封装 settings 业务逻辑。
+type Service struct {
+	repo              repository.SettingsRepository
+	dataEncryptionKey string
+	authSafety        authSafetyService
+	vectorStore       vectorStoreAvailabilityService
+	auditWriter       auditWriter
+	runtime           *config.Runtime
+}
+
+type authSafetyService interface {
+	HasActiveSuperAdminIdentity(ctx context.Context) (bool, error)
+}
+
+type vectorStoreAvailabilityService interface {
+	VectorStoreAvailable(ctx context.Context) (bool, error)
+}
+
+type auditWriter interface {
+	Write(ctx context.Context, input appaudit.WriteInput)
+}
+
+// NewService 创建服务。
+func NewService(repo repository.SettingsRepository, dataEncryptionKey string) *Service {
+	return &Service{repo: repo, dataEncryptionKey: strings.TrimSpace(dataEncryptionKey)}
+}
+
+func (s *Service) SetAuthSafetyService(service authSafetyService) {
+	s.authSafety = service
+}
+
+func (s *Service) SetVectorStoreAvailabilityService(service vectorStoreAvailabilityService) {
+	s.vectorStore = service
+}
+
+// SetAuditWriter 注入系统设置审计写入器。
+func (s *Service) SetAuditWriter(writer auditWriter) {
+	s.auditWriter = writer
+}
+
+// AuditInput 描述系统设置审计写入。
+type AuditInput struct {
+	UserID    uint
+	RequestID string
+	Action    string
+	ClientIP  string
+	UserAgent string
+	Detail    interface{}
+}
+
+// RecordAudit 记录系统设置审计日志。
+func (s *Service) RecordAudit(ctx context.Context, input AuditInput) {
+	if s.auditWriter == nil {
+		return
+	}
+	s.auditWriter.Write(ctx, appaudit.WriteInput{
+		RequestID:   input.RequestID,
+		ActorUserID: input.UserID,
+		Action:      input.Action,
+		Resource:    "system_settings",
+		IP:          input.ClientIP,
+		UserAgent:   input.UserAgent,
+		Detail:      input.Detail,
+	})
+}
+
+// Seed 将默认配置写入数据库（仅插入不存在的 key）。
+func (s *Service) Seed(ctx context.Context, _ ...config.Config) error {
+	for _, item := range obsoleteSettings() {
+		if err := s.repo.Delete(ctx, item.Namespace, item.Key); err != nil {
+			return err
+		}
+	}
+	items, err := s.encryptSettingsForStorage(defaultSettings())
+	if err != nil {
+		return err
+	}
+	if err := s.repo.UpsertWithDescription(ctx, items); err != nil {
+		return err
+	}
+	if err := s.migrateDefaultAllowedMIMETypes(ctx); err != nil {
+		return err
+	}
+	return s.migrateDefaultModelOptionAllowedPaths(ctx)
+}
+
+// ListAll 查询全部配置，按 namespace 分组。
+func (s *Service) ListAll(ctx context.Context) (map[string][]SettingItem, error) {
+	items, err := s.repo.ListAll(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.groupByNamespace(items), nil
+}
+
+// ListByNamespace 查询指定 namespace 的配置。
+func (s *Service) ListByNamespace(ctx context.Context, namespace string) ([]SettingItem, error) {
+	items, err := s.repo.ListByNamespace(ctx, namespace)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]SettingItem, 0, len(items))
+	for _, item := range items {
+		result = append(result, s.settingResponse(item))
+	}
+	return result, nil
+}
+
+// RuntimeValuesByNamespace 返回服务端运行时使用的配置值，敏感项会被解密。
+func (s *Service) RuntimeValuesByNamespace(ctx context.Context, namespace string) (map[string]string, error) {
+	items, err := s.repo.ListByNamespace(ctx, namespace)
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]string, len(items))
+	for _, item := range items {
+		value, err := s.decryptSettingValue(item)
+		if err != nil {
+			return nil, err
+		}
+		result[item.Key] = strings.TrimSpace(value)
+	}
+	return result, nil
+}
+
+func (s *Service) migrateDefaultAllowedMIMETypes(ctx context.Context) error {
+	items, err := s.repo.ListByNamespace(ctx, "file")
+	if err != nil {
+		return err
+	}
+	for _, item := range items {
+		if item.Key != "allowed_mime_types" {
+			continue
+		}
+		value := strings.TrimSpace(item.Value)
+		if value == "" || !sameCSVSet(value, legacyDefaultAllowedMIMETypes) {
+			return nil
+		}
+		updates, encryptErr := s.encryptSettingsForStorage([]domainsettings.SystemSetting{{
+			Namespace:   "file",
+			Key:         "allowed_mime_types",
+			Value:       defaultAllowedMIMETypes,
+			ValueType:   "string",
+			Description: "白名单MIME类型(逗号分隔)",
+		}})
+		if encryptErr != nil {
+			return encryptErr
+		}
+		return s.repo.Upsert(ctx, updates)
+	}
+	return nil
+}
+
+func (s *Service) migrateDefaultModelOptionAllowedPaths(ctx context.Context) error {
+	items, err := s.repo.ListByNamespace(ctx, "chat")
+	if err != nil {
+		return err
+	}
+	for _, item := range items {
+		if item.Key != "model_option_allowed_paths" || !isLegacyDefaultModelOptionAllowedPaths(item.Value) {
+			continue
+		}
+		updates, encryptErr := s.encryptSettingsForStorage([]domainsettings.SystemSetting{{
+			Namespace:   "chat",
+			Key:         "model_option_allowed_paths",
+			Value:       config.DefaultModelOptionAllowedPathsJSON(),
+			ValueType:   "json",
+			Description: "模型 options 白名单路径 JSON，default 对所有协议生效",
+		}})
+		if encryptErr != nil {
+			return encryptErr
+		}
+		return s.repo.Upsert(ctx, updates)
+	}
+	return nil
+}
+
+func isLegacyDefaultModelOptionAllowedPaths(value string) bool {
+	current := map[string][]string{}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(value)), &current); err != nil {
+		return false
+	}
+	latestDefault := map[string][]string{}
+	if err := json.Unmarshal([]byte(config.DefaultModelOptionAllowedPathsJSON()), &latestDefault); err != nil {
+		return false
+	}
+	previousGenerateContentDefault := cloneStringSliceMap(latestDefault)
+	previousGenerateContentDefault["gemini_generate_content"] = removeStringValue(
+		removeStringValue(
+			previousGenerateContentDefault["gemini_generate_content"],
+			"generationConfig.thinkingConfig.includeThoughts",
+		),
+		"generationConfig.thinkingConfig.thinkingLevel",
+	)
+	previousInteractionsDefault := cloneStringSliceMap(latestDefault)
+	previousInteractionsDefault["gemini_interactions"] = removeStringValue(
+		previousInteractionsDefault["gemini_interactions"],
+		"generation_config.thinking_summaries",
+	)
+	previousCombinedDefault := cloneStringSliceMap(previousGenerateContentDefault)
+	previousCombinedDefault["gemini_interactions"] = removeStringValue(
+		previousCombinedDefault["gemini_interactions"],
+		"generation_config.thinking_summaries",
+	)
+	legacyInteractionsDefault := cloneStringSliceMap(latestDefault)
+	legacyInteractionsDefault["gemini_interactions"] = append(
+		removeStringValue(legacyInteractionsDefault["gemini_interactions"], "response_format.schema"),
+		"responseFormat.type",
+		"responseFormat.aspectRatio",
+		"responseFormat.imageSize",
+		"responseFormat.mimeType",
+		"generationConfig.videoConfig.task",
+	)
+	legacyInteractionsWithoutSummaries := cloneStringSliceMap(legacyInteractionsDefault)
+	legacyInteractionsWithoutSummaries["gemini_interactions"] = removeStringValue(
+		legacyInteractionsWithoutSummaries["gemini_interactions"],
+		"generation_config.thinking_summaries",
+	)
+	legacyCombinedDefault := cloneStringSliceMap(legacyInteractionsWithoutSummaries)
+	legacyCombinedDefault["gemini_generate_content"] = previousGenerateContentDefault["gemini_generate_content"]
+	previousWithoutXAIVideoExtensions := cloneStringSliceMap(latestDefault)
+	delete(previousWithoutXAIVideoExtensions, "xai_video_extensions")
+	previousDefaults := []map[string][]string{
+		previousWithoutXAIVideoExtensions,
+		previousGenerateContentDefault,
+		previousInteractionsDefault,
+		previousCombinedDefault,
+		legacyInteractionsDefault,
+		legacyInteractionsWithoutSummaries,
+		legacyCombinedDefault,
+	}
+	for _, previousDefault := range previousDefaults {
+		if sameStringSliceMap(current, previousDefault) {
+			return true
+		}
+	}
+	olderDefaults := append([]map[string][]string{cloneStringSliceMap(latestDefault)}, previousDefaults...)
+	for _, olderDefault := range olderDefaults {
+		delete(olderDefault, "xai_video")
+		if sameStringSliceMap(current, olderDefault) {
+			return true
+		}
+		olderDefault["xai_responses"] = []string{"reasoning.effort"}
+		if sameStringSliceMap(current, olderDefault) {
+			return true
+		}
+	}
+	return false
+}
+
+func cloneStringSliceMap(value map[string][]string) map[string][]string {
+	result := make(map[string][]string, len(value))
+	for key, items := range value {
+		result[key] = append([]string(nil), items...)
+	}
+	return result
+}
+
+func removeStringValue(values []string, target string) []string {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if value != target {
+			result = append(result, value)
+		}
+	}
+	return result
+}
+
+func sameStringSliceMap(left map[string][]string, right map[string][]string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for key, leftValues := range left {
+		rightValues, ok := right[key]
+		if !ok || len(leftValues) != len(rightValues) {
+			return false
+		}
+		values := make(map[string]int, len(leftValues))
+		for _, value := range leftValues {
+			values[value]++
+		}
+		for _, value := range rightValues {
+			values[value]--
+		}
+		for _, count := range values {
+			if count != 0 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func sameCSVSet(left string, right string) bool {
+	leftSet := csvSet(left)
+	rightSet := csvSet(right)
+	if len(leftSet) != len(rightSet) {
+		return false
+	}
+	for item := range leftSet {
+		if _, ok := rightSet[item]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func csvSet(raw string) map[string]struct{} {
+	parts := strings.Split(raw, ",")
+	result := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		value := strings.ToLower(strings.TrimSpace(part))
+		if value == "" {
+			continue
+		}
+		result[value] = struct{}{}
+	}
+	return result
+}
+
+// validNamespaces 合法的 namespace 集合。
+var validNamespaces = map[string]bool{
+	"auth":           true,
+	"billing":        true,
+	"chat":           true,
+	"storage":        true,
+	"file":           true,
+	"extract":        true,
+	"mcp":            true,
+	"circuit":        true,
+	"agent_group":    true,
+	"platform_tools": true,
+}
+
+var validSettingKeys = buildValidSettingKeys()
+
+// BatchUpdate 批量更新配置项。
+func (s *Service) BatchUpdate(ctx context.Context, patches []PatchItem) (map[string][]SettingItem, error) {
+	// 校验 namespace
+	for _, p := range patches {
+		if !IsValidNamespace(p.Namespace) {
+			return nil, fmt.Errorf("%w: invalid namespace: %s", ErrInvalidSetting, p.Namespace)
+		}
+		if err := validatePatchItem(p); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidSetting, err)
+		}
+	}
+
+	if err := s.rejectLockedSettings(ctx, patches); err != nil {
+		return nil, err
+	}
+
+	patches, err := s.applyAuthSettingDependencies(ctx, patches)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidSetting, err)
+	}
+	patches, err = s.applyEmbeddingDependentCascades(ctx, patches)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidSetting, err)
+	}
+
+	if err := s.validateFileProcessingSettings(ctx, patches); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidSetting, err)
+	}
+	if err := s.validateEmbeddingDependentSettings(ctx, patches); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidSetting, err)
+	}
+	if err := s.validateBillingPaymentSettings(ctx, patches); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidSetting, err)
+	}
+	items, err := s.preparePatchItemsForStorage(patches)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidSetting, err)
+	}
+	if err := s.repo.Upsert(ctx, items); err != nil {
+		return nil, err
+	}
+
+	return s.ListAll(ctx)
+}
+
+func (s *Service) groupByNamespace(items []domainsettings.SystemSetting) map[string][]SettingItem {
+	result := make(map[string][]SettingItem)
+	for _, item := range items {
+		if _, ok := validSettingKeys[item.Namespace+":"+item.Key]; !ok {
+			continue
+		}
+		result[item.Namespace] = append(result[item.Namespace], s.settingResponse(item))
+	}
+	return result
+}
+
+func validatePatchItem(item PatchItem) error {
+	if spec, ok := lookupSettingSpec(item.Namespace, item.Key); ok {
+		if item.Clear {
+			if !spec.Sensitive {
+				return newSettingValidationError(settingValidationCode(item.Namespace, item.Key), SettingValidationDetails{Field: spec.fullKey(), Rule: "clear_not_allowed"})
+			}
+			return nil
+		}
+		return validateSettingValue(item.Namespace, item.Key, item.Value)
+	}
+	return newSettingValidationError(settingCodeInvalidKey, SettingValidationDetails{Rule: "invalid_key"})
+}
+
+func validateLegacyCustomPatchItem(item PatchItem) error {
+	key := item.Namespace + ":" + item.Key
+	value := strings.TrimSpace(item.Value)
+	switch key {
+	case "billing:mode":
+		switch value {
+		case "self", "period", "usage":
+			return nil
+		default:
+			return fmt.Errorf("%s must be one of: self, period, usage", key)
+		}
+	case "billing:payment_providers":
+		for _, provider := range normalizePaymentProvidersSetting(value) {
+			switch provider {
+			case "stripe", "epay":
+			default:
+				return fmt.Errorf("%s must contain only: stripe, epay", key)
+			}
+		}
+		return nil
+	case "billing:usd_to_cny_rate":
+		return validateFloatMinMax(value, 0.000001, 1000, key)
+	case "billing:display_currency":
+		switch value {
+		case "USD", "CNY":
+			return nil
+		default:
+			return fmt.Errorf("%s must be one of: USD, CNY", key)
+		}
+	case "billing:prepaid_amount_usd":
+		return validateFloatMinMax(value, 0, 1000000, key)
+	case "billing:stripe_publishable_key", "billing:stripe_secret_key", "billing:stripe_webhook_secret", "billing:epay_pid", "billing:epay_key":
+		return validateStringMax(value, 512, key)
+	case "billing:epay_types":
+		if err := validateStringMax(value, 4000, key); err != nil {
+			return err
+		}
+		return validateEPayTypesJSON(value, key)
+	case "billing:native_tool_pricing_json":
+		return validateNativeToolPricingJSON(value, key)
+	case "billing:epay_gateway_url":
+		if err := validateStringMax(value, 512, key); err != nil {
+			return err
+		}
+		if value == "" {
+			return nil
+		}
+		if _, err := domainbilling.ResolveEPaySubmitURL(value); err != nil {
+			return fmt.Errorf("%s must be an HTTP(S) EPay site URL or an exact submit.php URL without credentials, query, or fragment", key)
+		}
+		return nil
+	case "chat:model_option_policy_mode":
+		switch value {
+		case "allowlist", "denylist", "disabled":
+			return nil
+		default:
+			return fmt.Errorf("%s must be one of: allowlist, denylist, disabled", key)
+		}
+	case "chat:model_option_allowed_paths", "chat:model_option_denied_paths":
+		return validateModelOptionPathsJSON(value, key)
+	case "auth:login_default_next_path":
+		if value == "" {
+			return fmt.Errorf("%s cannot be empty", key)
+		}
+		if !strings.HasPrefix(value, "/") || strings.HasPrefix(value, "//") {
+			return fmt.Errorf("%s must be a local path", key)
+		}
+		return validateStringMax(value, 120, key)
+	case "auth:token_ttl_hours":
+		return validateIntMinMax(value, 1, 168, key)
+	case "auth:refresh_token_ttl_hours":
+		return validateIntMinMax(value, 1, 8760, key)
+	case "auth:rate_limit_rpm", "auth:public_auth_rate_limit_rpm":
+		return validateIntMinMax(value, 1, 100000, key)
+	case "auth:smtp_host":
+		return validateStringMax(value, 255, key)
+	case "auth:smtp_username", "auth:smtp_password", "auth:smtp_from":
+		return validateStringMax(value, 255, key)
+	case "auth:turnstile_site_key", "auth:turnstile_secret_key":
+		return validateStringMax(value, 512, key)
+	case "chat:conversation_default_model":
+		return validateStringMax(value, 255, key)
+	case "chat:multimodal_delegation_model",
+		"chat:multimodal_delegation_image_model",
+		"chat:multimodal_delegation_audio_model",
+		"chat:multimodal_delegation_video_model":
+		return validateStringMax(value, 255, key)
+	case "chat:multimodal_delegation_modalities":
+		return validateMultimodalDelegationModalities(value, key)
+	case "chat:multimodal_delegation_timeout_seconds":
+		return validateIntMinMax(value, 1, 600, key)
+	case "chat:default_system_prompt", "chat:skills_prompt":
+		return validateStringMax(value, 20000, key)
+	case "auth:smtp_port":
+		return validateIntMinMax(value, 1, 65535, key)
+	case "auth:email_registration_allowed_domains":
+		return validateEmailDomainList(value, key)
+	case "storage:max_upload_file_bytes":
+		return validateInt64Min(value, 1, key)
+	case "storage:image_format":
+		switch value {
+		case "original", "webp_lossless", "webp_lossy":
+			return nil
+		default:
+			return fmt.Errorf("%s must be one of: original, webp_lossless, webp_lossy", key)
+		}
+	case "storage:image_quality":
+		return validateIntMinMax(value, 1, 100, key)
+	case "storage:user_storage_quota_bytes":
+		return validateInt64Min(value, 0, key)
+	case "file:file_full_context_max_bytes":
+		return validateOptionalInt64Min(value, 0, key)
+	case "file:image_max_bytes", "file:doc_max_bytes":
+		if value == "" {
+			return nil
+		}
+		return validateInt64Min(value, 1, key)
+	case "storage:max_message_files":
+		return validateIntMinMax(value, 1, 50, key)
+	case "file:image_max_dimension":
+		return validateIntMinMax(value, 0, 8192, key)
+	case "file:full_context_max_tokens":
+		return validateOptionalIntZeroOrMinMax(value, 128, 1000000, key)
+	case "file:full_context_pdf_max_pages":
+		return validateOptionalIntZeroOrMinMax(value, 1, 500, key)
+	case "file:rag_top_k":
+		return validateIntMinMax(value, 1, 50, key)
+	case "chat:rag_min_similarity":
+		return validateFloatMinMax(value, 0.000001, 1, key)
+	case "chat:rag_token_budget":
+		return validateIntMinMax(value, 128, 100000, key)
+	case "chat:rag_fetch_multiplier":
+		return validateIntMinMax(value, 1, 20, key)
+	case "chat:rag_wait_ready_ms":
+		return validateIntMinMax(value, 1000, 120000, key)
+	case "chat:rag_query_history_turns":
+		return validateIntMinMax(value, 0, 20, key)
+	case "chat:rag_retrieval_cache_ttl_seconds":
+		return validateIntMinMax(value, 0, 86400, key)
+	case "chat:context_artifact_retention_days":
+		return validateIntMinMax(value, 0, 3650, key)
+	case "file:embedding_timeout_seconds":
+		return validateIntMinMax(value, 1, 600, key)
+	case "file:embedding_host":
+		if value == "" {
+			return nil
+		}
+		if err := security.ValidateTrustedOutboundHTTPURL(value); err != nil {
+			return fmt.Errorf("%s must be a valid trusted HTTP endpoint", key)
+		}
+		return nil
+	case "file:embedding_output_dimensions":
+		return validateIntMinMax(value, 64, 4096, key)
+	case "file:embedding_model_dimensions":
+		return validateIntMinMax(value, 64, 4096, key)
+	case "file:allowed_mime_types":
+		if len(value) == 0 {
+			return fmt.Errorf("%s cannot be empty", key)
+		}
+		for _, part := range strings.Split(value, ",") {
+			part = strings.TrimSpace(part)
+			if !strings.Contains(part, "/") {
+				return fmt.Errorf("%s contains invalid mime: %s", key, part)
+			}
+		}
+	case "extract:engine":
+		switch value {
+		case extraction.EngineBuiltin, extraction.EngineTika, extraction.EngineDocling, extraction.EngineMinerU:
+			return nil
+		default:
+			return fmt.Errorf("%s must be one of: %s, %s, %s, %s", key, extraction.EngineBuiltin, extraction.EngineTika, extraction.EngineDocling, extraction.EngineMinerU)
+		}
+	case "extract:ocr_engine":
+		switch value {
+		case extraction.OCREngineRapidOCR, extraction.OCREngineTesseract, extraction.OCREnginePaddle, extraction.OCREngineTencent, extraction.OCREngineAliyun, extraction.OCREngineMistral, extraction.OCREngineLLM, extraction.OCREngineSystemVision:
+			return nil
+		default:
+			return fmt.Errorf("%s must be one of: %s, %s, %s, %s, %s, %s, %s, %s", key, extraction.OCREngineRapidOCR, extraction.OCREngineTesseract, extraction.OCREnginePaddle, extraction.OCREngineTencent, extraction.OCREngineAliyun, extraction.OCREngineMistral, extraction.OCREngineLLM, extraction.OCREngineSystemVision)
+		}
+	case "extract:tika_source":
+		switch value {
+		case extraction.TikaSourceExternal, extraction.TikaSourceManaged:
+			return nil
+		default:
+			return fmt.Errorf("%s must be one of: %s, %s", key, extraction.TikaSourceExternal, extraction.TikaSourceManaged)
+		}
+	case "extract:mineru_source":
+		switch value {
+		case extractport.MinerUSourceCloud, extractport.MinerUSourceSelfHosted:
+			return nil
+		default:
+			return fmt.Errorf("%s must be one of: %s, %s", key, extractport.MinerUSourceCloud, extractport.MinerUSourceSelfHosted)
+		}
+	case "extract:mineru_file_types":
+		return validateMinerUFileTypes(value, key)
+	case "extract:tika_base_url":
+		if value == "" {
+			return nil
+		}
+		if !strings.HasPrefix(value, "http://") && !strings.HasPrefix(value, "https://") {
+			return fmt.Errorf("%s must start with http:// or https://", key)
+		}
+		return nil
+	case "extract:docling_base_url", "extract:tesseract_ocr_base_url", "extract:rapidocr_base_url", "extract:paddle_ocr_base_url", "extract:mineru_base_url", "extract:llm_ocr_base_url":
+		if value == "" {
+			return nil
+		}
+		if !strings.HasPrefix(value, "http://") && !strings.HasPrefix(value, "https://") {
+			return fmt.Errorf("%s must start with http:// or https://", key)
+		}
+		return nil
+	case "extract:mistral_ocr_base_url":
+		if value == "" {
+			return nil
+		}
+		if err := security.ValidateTrustedOutboundHTTPURL(value); err != nil {
+			return fmt.Errorf("%s must be a valid trusted HTTP endpoint", key)
+		}
+		return nil
+	case "extract:rapidocr_source":
+		switch value {
+		case extraction.TikaSourceExternal, extraction.TikaSourceManaged:
+			return nil
+		default:
+			return fmt.Errorf("%s must be one of: %s, %s", key, extraction.TikaSourceExternal, extraction.TikaSourceManaged)
+		}
+	case "extract:tencent_ocr_endpoint", "extract:aliyun_ocr_endpoint", "extract:tencent_ocr_region", "extract:aliyun_ocr_region":
+		return validateStringMax(value, 255, key)
+	case "extract:tencent_ocr_secret_id", "extract:tencent_ocr_secret_key", "extract:aliyun_ocr_access_key_id", "extract:aliyun_ocr_access_key_secret":
+		return validateStringMax(value, 512, key)
+	case "auth:username_login_enabled", "auth:email_login_enabled", "auth:third_party_login_enabled", "auth:email_registration_enabled", "auth:email_verification_enabled", "auth:password_reset_enabled", "auth:email_registration_block_plus_alias", "auth:auto_link_verified_email", "auth:turnstile_registration_enabled", "auth:rate_limit_enabled", "billing:native_tool_billing_enabled", "chat:rag_enabled", "chat:rag_hybrid_enabled", "chat:message_embedding_enabled", "chat:semantic_context_enabled", "file:full_context_limit_enabled", "file:embedding_enabled", "file:embed_trigger_on_upload", "file:embedding_normalize", "extract:image_ocr_enabled", "extract:pdf_ocr_fallback_enabled", "mcp:mcp_enable", "chat:user_upstream_enabled", "chat:user_upstream_require_approval", "file:user_embedding_enabled", "chat:user_rag_enabled":
+		if _, err := strconv.ParseBool(value); err != nil {
+			return fmt.Errorf("%s must be bool", key)
+		}
+	case "chat:user_upstream_billing_mode":
+		switch value {
+		case "disabled", "statistics_only", "platform_pricing":
+			return nil
+		default:
+			return fmt.Errorf("%s must be one of: disabled, statistics_only, platform_pricing", key)
+		}
+	case "chat:user_upstream_quota_limit", "file:user_embedding_profile_limit":
+		v, err := strconv.Atoi(value)
+		if err != nil || v < 0 {
+			return fmt.Errorf("%s must be non-negative integer", key)
+		}
+	case "file:user_embedding_min_dimensions", "file:user_embedding_max_dimensions":
+		return validateIntMinMax(value, 1, 65536, key)
+	case "file:user_embedding_allowed_protocols":
+		return validateStringMax(value, 255, key)
+	case "extract:tika_timeout_seconds":
+		return validateIntMinMax(value, 1, 120, key)
+	case "extract:docling_timeout_seconds", "extract:tesseract_ocr_timeout_seconds", "extract:rapidocr_timeout_seconds", "extract:paddle_ocr_timeout_seconds", "extract:tencent_ocr_timeout_seconds", "extract:aliyun_ocr_timeout_seconds", "extract:mineru_timeout_seconds", "extract:mistral_ocr_timeout_seconds", "extract:llm_ocr_timeout_seconds":
+		return validateIntMinMax(value, 1, 600, key)
+	case "mcp:mcp_max_llm_calls_per_run":
+		return validateIntMinMax(value, 2, 32, key)
+	case "mcp:mcp_max_tool_calls_per_run":
+		return validateIntMinMax(value, 1, 64, key)
+	case "mcp:mcp_max_concurrent_calls":
+		return validateIntMinMax(value, 1, 64, key)
+	case "mcp:mcp_max_selected_tools_per_message":
+		return validateIntMinMax(value, 1, config.MaxMCPSelectedToolsPerMessage, key)
+	case "mcp:mcp_tool_timeout_seconds":
+		return validateIntMinMax(value, 0, maxMCPToolTimeoutSeconds, key)
+	case "mcp:mcp_tool_retry_count":
+		return validateIntMinMax(value, 0, 5, key)
+	case "mcp:mcp_tool_prompt":
+		return validateStringMax(value, 20000, key)
+	case "platform_tools:image_gen_enabled":
+		if _, err := strconv.ParseBool(value); err != nil {
+			return fmt.Errorf("%s must be bool", key)
+		}
+	case "platform_tools:image_gen_channels":
+		return validateImageGenChannelsJSON(value, key)
+	}
+	return nil
+}
+
+func validateMultimodalDelegationModalities(value string, key string) error {
+	seen := make(map[string]struct{}, 3)
+	for _, raw := range strings.Split(value, ",") {
+		modality := strings.ToLower(strings.TrimSpace(raw))
+		if modality == "" {
+			continue
+		}
+		switch modality {
+		case "image", "audio", "video":
+			seen[modality] = struct{}{}
+		default:
+			return fmt.Errorf("%s must contain only: image, audio, video", key)
+		}
+	}
+	if len(seen) == 0 {
+		return fmt.Errorf("%s must enable at least one modality", key)
+	}
+	return nil
+}
+
+// imageGenChannelSetting 平台 image_gen 渠道配置项（系统设置里存 JSON）。
+type imageGenChannelSetting struct {
+	Model string `json:"model"`
+	Note  string `json:"note,omitempty"`
+}
+
+func validateImageGenChannelsJSON(value string, key string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fmt.Errorf("%s is required", key)
+	}
+	var items []imageGenChannelSetting
+	if err := json.Unmarshal([]byte(value), &items); err != nil {
+		return fmt.Errorf("%s must be a JSON array", key)
+	}
+	if len(items) > 32 {
+		return fmt.Errorf("%s must contain at most 32 channels", key)
+	}
+	seen := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		model := strings.TrimSpace(item.Model)
+		if model == "" {
+			return fmt.Errorf("%s items require model", key)
+		}
+		if len(model) > 255 {
+			return fmt.Errorf("%s item model is too long", key)
+		}
+		if len(item.Note) > 512 {
+			return fmt.Errorf("%s item note is too long", key)
+		}
+		if _, ok := seen[model]; ok {
+			return fmt.Errorf("%s contains duplicate model %q", key, model)
+		}
+		seen[model] = struct{}{}
+	}
+	return nil
+}
+
+func (s *Service) validateFileProcessingSettings(ctx context.Context, patches []PatchItem) error {
+	hasRelevantPatch := false
+	for _, item := range patches {
+		if item.Namespace == "extract" || item.Namespace == "file" ||
+			(item.Namespace == "chat" && (item.Key == "multimodal_delegation_enabled" ||
+				item.Key == "multimodal_delegation_image_model" ||
+				item.Key == "multimodal_delegation_modalities")) {
+			hasRelevantPatch = true
+			break
+		}
+	}
+	if !hasRelevantPatch {
+		return nil
+	}
+
+	next, err := s.loadEffectiveSettings(ctx, "extract", "file", "chat")
+	if err != nil {
+		return err
+	}
+	applyPatchesToEffectiveSettings(next, patches, "extract", "file", "chat")
+
+	if strings.TrimSpace(next["extract:engine"]) == extraction.EngineTika {
+		if strings.TrimSpace(next["extract:tika_base_url"]) == "" {
+			return fmt.Errorf("extract:tika_base_url is required when extract:engine is tika")
+		}
+	}
+	if strings.TrimSpace(next["extract:engine"]) == extraction.EngineDocling && strings.TrimSpace(next["extract:docling_base_url"]) == "" {
+		return fmt.Errorf("extract:docling_base_url is required when extract:engine is docling")
+	}
+	if strings.TrimSpace(next["extract:engine"]) == extraction.EngineMinerU && strings.TrimSpace(next["extract:mineru_base_url"]) == "" {
+		return fmt.Errorf("extract:mineru_base_url is required when extract:engine is mineru")
+	}
+
+	imageOCREnabled, _ := strconv.ParseBool(strings.TrimSpace(next["extract:image_ocr_enabled"]))
+	pdfOCRFallbackEnabled, _ := strconv.ParseBool(strings.TrimSpace(next["extract:pdf_ocr_fallback_enabled"]))
+	if !imageOCREnabled && !pdfOCRFallbackEnabled {
+		return nil
+	}
+
+	switch strings.TrimSpace(next["extract:ocr_engine"]) {
+	case extraction.OCREngineTesseract:
+		if strings.TrimSpace(next["extract:tesseract_ocr_base_url"]) == "" {
+			return fmt.Errorf("extract:tesseract_ocr_base_url is required when OCR engine is tesseract")
+		}
+	case extraction.OCREngineRapidOCR:
+		if strings.TrimSpace(next["extract:rapidocr_base_url"]) == "" {
+			return fmt.Errorf("extract:rapidocr_base_url is required when OCR engine is rapidocr")
+		}
+	case extraction.OCREnginePaddle:
+		if strings.TrimSpace(next["extract:paddle_ocr_base_url"]) == "" {
+			return fmt.Errorf("extract:paddle_ocr_base_url is required when OCR engine is paddle")
+		}
+	case extraction.OCREngineTencent:
+		if strings.TrimSpace(next["extract:tencent_ocr_secret_id"]) == "" {
+			return fmt.Errorf("extract:tencent_ocr_secret_id is required when OCR engine is tencent")
+		}
+		if strings.TrimSpace(next["extract:tencent_ocr_secret_key"]) == "" {
+			return fmt.Errorf("extract:tencent_ocr_secret_key is required when OCR engine is tencent")
+		}
+		if strings.TrimSpace(next["extract:tencent_ocr_region"]) == "" {
+			return fmt.Errorf("extract:tencent_ocr_region is required when OCR engine is tencent")
+		}
+	case extraction.OCREngineAliyun:
+		if strings.TrimSpace(next["extract:aliyun_ocr_access_key_id"]) == "" {
+			return fmt.Errorf("extract:aliyun_ocr_access_key_id is required when OCR engine is aliyun")
+		}
+		if strings.TrimSpace(next["extract:aliyun_ocr_access_key_secret"]) == "" {
+			return fmt.Errorf("extract:aliyun_ocr_access_key_secret is required when OCR engine is aliyun")
+		}
+		if strings.TrimSpace(next["extract:aliyun_ocr_region"]) == "" {
+			return fmt.Errorf("extract:aliyun_ocr_region is required when OCR engine is aliyun")
+		}
+	case extraction.OCREngineMistral:
+		if strings.TrimSpace(next["extract:mistral_ocr_base_url"]) == "" {
+			return fmt.Errorf("extract:mistral_ocr_base_url is required when OCR engine is mistral")
+		}
+		if strings.TrimSpace(next["extract:mistral_ocr_auth_token"]) == "" {
+			return fmt.Errorf("extract:mistral_ocr_auth_token is required when OCR engine is mistral")
+		}
+		if strings.TrimSpace(next["extract:mistral_ocr_model"]) == "" {
+			return fmt.Errorf("extract:mistral_ocr_model is required when OCR engine is mistral")
+		}
+	case extraction.OCREngineLLM:
+		if strings.TrimSpace(next["extract:llm_ocr_base_url"]) == "" {
+			return fmt.Errorf("extract:llm_ocr_base_url is required when OCR engine is llm")
+		}
+		if strings.TrimSpace(next["extract:llm_ocr_model"]) == "" {
+			return fmt.Errorf("extract:llm_ocr_model is required when OCR engine is llm")
+		}
+	case extraction.OCREngineSystemVision:
+		if !imageOCREnabled || pdfOCRFallbackEnabled {
+			return fmt.Errorf("system_vision OCR supports image extraction only")
+		}
+		delegationEnabled, _ := strconv.ParseBool(strings.TrimSpace(next["chat:multimodal_delegation_enabled"]))
+		if !delegationEnabled {
+			return fmt.Errorf("chat:multimodal_delegation_enabled is required when OCR engine is system_vision")
+		}
+		if strings.TrimSpace(next["chat:multimodal_delegation_image_model"]) == "" {
+			return fmt.Errorf("chat:multimodal_delegation_image_model is required when OCR engine is system_vision")
+		}
+		modalities := "," + strings.ToLower(strings.ReplaceAll(next["chat:multimodal_delegation_modalities"], " ", "")) + ","
+		if !strings.Contains(modalities, ",image,") {
+			return fmt.Errorf("chat:multimodal_delegation_modalities must include image when OCR engine is system_vision")
+		}
+	}
+
+	return nil
+}
+
+func (s *Service) applyAuthSettingDependencies(ctx context.Context, patches []PatchItem) ([]PatchItem, error) {
+	hasAuthPatch := false
+	for _, item := range patches {
+		if item.Namespace == "auth" {
+			hasAuthPatch = true
+			break
+		}
+	}
+	if !hasAuthPatch {
+		return patches, nil
+	}
+
+	next, err := s.loadEffectiveSettings(ctx, "auth")
+	if err != nil {
+		return nil, err
+	}
+	applyPatchesToEffectiveSettings(next, patches, "auth")
+
+	emailLoginEnabled, _ := strconv.ParseBool(next["auth:email_login_enabled"])
+	usernameLoginEnabled, _ := strconv.ParseBool(next["auth:username_login_enabled"])
+	thirdPartyLoginEnabled, _ := strconv.ParseBool(next["auth:third_party_login_enabled"])
+	if !emailLoginEnabled && !usernameLoginEnabled {
+		if !thirdPartyLoginEnabled {
+			return nil, fmt.Errorf("auth:third_party_login_enabled must be enabled before disabling username and email login")
+		}
+		if s.authSafety == nil {
+			return nil, fmt.Errorf("at least one superadmin must bind a third-party identity before disabling username and email login")
+		}
+		hasBoundAdmin, err := s.authSafety.HasActiveSuperAdminIdentity(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if !hasBoundAdmin {
+			return nil, fmt.Errorf("at least one superadmin must bind a third-party identity before disabling username and email login")
+		}
+	}
+	if !emailLoginEnabled {
+		if patchValueIsTrue(patches, "auth", "email_registration_enabled") {
+			return nil, fmt.Errorf("auth:email_registration_enabled requires auth:email_login_enabled")
+		}
+		patches = upsertPatch(patches, PatchItem{Namespace: "auth", Key: "email_registration_enabled", Value: "false"})
+		next["auth:email_registration_enabled"] = "false"
+	}
+	emailRegistrationEnabled, _ := strconv.ParseBool(next["auth:email_registration_enabled"])
+	turnstileRegistrationEnabled, _ := strconv.ParseBool(next["auth:turnstile_registration_enabled"])
+	if !emailRegistrationEnabled {
+		if patchValueIsTrue(patches, "auth", "turnstile_registration_enabled") {
+			return nil, fmt.Errorf("auth:turnstile_registration_enabled requires auth:email_registration_enabled")
+		}
+		patches = upsertPatch(patches, PatchItem{Namespace: "auth", Key: "turnstile_registration_enabled", Value: "false"})
+		next["auth:turnstile_registration_enabled"] = "false"
+		turnstileRegistrationEnabled = false
+	}
+	if turnstileRegistrationEnabled {
+		if strings.TrimSpace(next["auth:turnstile_site_key"]) == "" {
+			return nil, fmt.Errorf("auth:turnstile_site_key is required when auth:turnstile_registration_enabled is true")
+		}
+		if strings.TrimSpace(next["auth:turnstile_secret_key"]) == "" {
+			return nil, fmt.Errorf("auth:turnstile_secret_key is required when auth:turnstile_registration_enabled is true")
+		}
+	}
+	emailVerificationEnabled, _ := strconv.ParseBool(next["auth:email_verification_enabled"])
+	passwordResetEnabled, _ := strconv.ParseBool(next["auth:password_reset_enabled"])
+	if !emailVerificationEnabled {
+		if patchValueIsTrue(patches, "auth", "password_reset_enabled") {
+			return nil, fmt.Errorf("auth:password_reset_enabled requires auth:email_verification_enabled")
+		}
+		patches = upsertPatch(patches, PatchItem{Namespace: "auth", Key: "password_reset_enabled", Value: "false"})
+		next["auth:password_reset_enabled"] = "false"
+		passwordResetEnabled = false
+	}
+	if emailVerificationEnabled {
+		if err := validateEmailVerificationSMTPSettings(next); err != nil {
+			return nil, err
+		}
+	}
+	if passwordResetEnabled && !usernameLoginEnabled && !emailLoginEnabled {
+		return nil, fmt.Errorf("auth:password_reset_enabled requires username or email login")
+	}
+
+	return patches, nil
+}
+
+func validateEmailVerificationSMTPSettings(next map[string]string) error {
+	required := []struct {
+		key   string
+		label string
+	}{
+		{key: "auth:smtp_host", label: "auth:smtp_host"},
+		{key: "auth:smtp_port", label: "auth:smtp_port"},
+		{key: "auth:smtp_username", label: "auth:smtp_username"},
+		{key: "auth:smtp_password", label: "auth:smtp_password"},
+	}
+	missing := make([]string, 0, len(required))
+	for _, item := range required {
+		if strings.TrimSpace(next[item.key]) == "" {
+			missing = append(missing, item.label)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("email verification requires settings: %s", strings.Join(missing, ", "))
+	}
+	port, err := strconv.Atoi(strings.TrimSpace(next["auth:smtp_port"]))
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("auth:smtp_port must be an integer between 1 and 65535")
+	}
+	return nil
+}
+
+func (s *Service) applyEmbeddingDependentCascades(ctx context.Context, patches []PatchItem) ([]PatchItem, error) {
+	hasEmbeddingPatch := false
+	for _, item := range patches {
+		if item.Namespace == "file" && (item.Key == "embedding_enabled" || item.Key == "embedding_host" || item.Key == "embedding_protocol" || item.Key == "rag_model") {
+			hasEmbeddingPatch = true
+			break
+		}
+	}
+	if !hasEmbeddingPatch {
+		return patches, nil
+	}
+
+	next, err := s.loadEffectiveSettings(ctx, "chat", "file")
+	if err != nil {
+		return nil, err
+	}
+	applyPatchesToEffectiveSettings(next, patches, "chat", "file")
+	if embeddingServiceReady(next) {
+		return patches, nil
+	}
+
+	hasRAGPatch := false
+	hasMessagePatch := false
+	hasSemanticPatch := false
+	for _, item := range patches {
+		if item.Namespace != "chat" {
+			continue
+		}
+		switch item.Key {
+		case "rag_enabled":
+			hasRAGPatch = true
+		case "message_embedding_enabled":
+			hasMessagePatch = true
+		case "semantic_context_enabled":
+			hasSemanticPatch = true
+		}
+	}
+	if !hasRAGPatch {
+		patches = append(patches, PatchItem{Namespace: "chat", Key: "rag_enabled", Value: "false"})
+	}
+	if !hasMessagePatch {
+		patches = append(patches, PatchItem{Namespace: "chat", Key: "message_embedding_enabled", Value: "false"})
+	}
+	if !hasSemanticPatch {
+		patches = append(patches, PatchItem{Namespace: "chat", Key: "semantic_context_enabled", Value: "false"})
+	}
+	return patches, nil
+}
+
+func patchValueIsTrue(patches []PatchItem, namespace string, key string) bool {
+	for _, item := range patches {
+		if item.Namespace == namespace && item.Key == key {
+			value, _ := strconv.ParseBool(strings.TrimSpace(item.Value))
+			return value
+		}
+	}
+	return false
+}
+
+func upsertPatch(patches []PatchItem, next PatchItem) []PatchItem {
+	for index, item := range patches {
+		if item.Namespace == next.Namespace && item.Key == next.Key {
+			patches[index] = next
+			return patches
+		}
+	}
+	return append(patches, next)
+}
+
+func (s *Service) validateEmbeddingDependentSettings(ctx context.Context, patches []PatchItem) error {
+	requiresValidation := false
+	for _, item := range patches {
+		if item.Namespace == "file" {
+			switch item.Key {
+			case "embedding_enabled", "embedding_host", "embedding_protocol", "rag_model":
+				requiresValidation = true
+			}
+		}
+		if item.Namespace == "chat" {
+			switch item.Key {
+			case "rag_enabled", "message_embedding_enabled", "semantic_context_enabled":
+				requiresValidation = true
+			}
+		}
+	}
+	if !requiresValidation {
+		return nil
+	}
+
+	next, err := s.loadEffectiveSettings(ctx, "chat", "file")
+	if err != nil {
+		return err
+	}
+	applyPatchesToEffectiveSettings(next, patches, "chat", "file")
+
+	embeddingEnabled, _ := strconv.ParseBool(next["file:embedding_enabled"])
+	ragEnabled, _ := strconv.ParseBool(next["chat:rag_enabled"])
+	messageEmbeddingEnabled, _ := strconv.ParseBool(next["chat:message_embedding_enabled"])
+	semanticContextEnabled, _ := strconv.ParseBool(next["chat:semantic_context_enabled"])
+	if semanticContextEnabled && !messageEmbeddingEnabled {
+		return fmt.Errorf("chat:message_embedding_enabled is required when chat:semantic_context_enabled is true")
+	}
+	if embeddingEnabled || ragEnabled || messageEmbeddingEnabled || semanticContextEnabled {
+		if !embeddingServiceReady(next) {
+			return fmt.Errorf("embedding service must be enabled and configured before enabling embedding features")
+		}
+		if s.vectorStore != nil {
+			available, err := s.vectorStore.VectorStoreAvailable(ctx)
+			if err != nil {
+				return err
+			}
+			if !available {
+				return fmt.Errorf("vector store is unavailable; enable a supported vector store before enabling embedding features")
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Service) validateBillingPaymentSettings(ctx context.Context, patches []PatchItem) error {
+	hasBillingPatch := false
+	for _, item := range patches {
+		if item.Namespace == "billing" {
+			hasBillingPatch = true
+			break
+		}
+	}
+	if !hasBillingPatch {
+		return nil
+	}
+
+	next, err := s.loadEffectiveSettings(ctx, "billing")
+	if err != nil {
+		return err
+	}
+	applyPatchesToEffectiveSettings(next, patches, "billing")
+
+	providers := normalizePaymentProvidersSetting(next["billing:payment_providers"])
+	if len(providers) == 0 {
+		return nil
+	}
+	for _, provider := range providers {
+		switch provider {
+		case "stripe":
+			if err := requireSettingFields(next, []requiredSettingField{
+				{key: "billing:stripe_secret_key", label: "Stripe Secret Key"},
+				{key: "billing:stripe_webhook_secret", label: "Stripe Webhook Secret"},
+			}); err != nil {
+				return err
+			}
+		case "epay":
+			if err := validateFloatMinMax(next["billing:usd_to_cny_rate"], 0.000001, 1000, "billing:usd_to_cny_rate"); err != nil {
+				return err
+			}
+			if err := requireSettingFields(next, []requiredSettingField{
+				{key: "billing:epay_gateway_url", label: "billing:epay_gateway_url"},
+				{key: "billing:epay_types", label: "billing:epay_types"},
+				{key: "billing:epay_pid", label: "billing:epay_pid"},
+				{key: "billing:epay_key", label: "billing:epay_key"},
+			}); err != nil {
+				return err
+			}
+			if _, err := domainbilling.ResolveEPaySubmitURL(next["billing:epay_gateway_url"]); err != nil {
+				return fmt.Errorf("billing:epay_gateway_url must be an HTTP(S) EPay site URL or an exact submit.php URL without credentials, query, or fragment")
+			}
+		default:
+			return fmt.Errorf("billing:payment_providers must contain only: stripe, epay")
+		}
+	}
+	return nil
+}
+
+type requiredSettingField struct {
+	key   string
+	label string
+}
+
+func requireSettingFields(values map[string]string, fields []requiredSettingField) error {
+	missing := make([]string, 0, len(fields))
+	for _, item := range fields {
+		if strings.TrimSpace(values[item.key]) == "" {
+			missing = append(missing, item.label)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("missing required settings: %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+func embeddingServiceReady(settings map[string]string) bool {
+	embeddingEnabled, _ := strconv.ParseBool(settings["file:embedding_enabled"])
+	return embeddingEnabled &&
+		strings.TrimSpace(settings["file:rag_model"]) != "" &&
+		strings.TrimSpace(settings["file:embedding_host"]) != ""
+}
+
+func validateIntMinMax(value string, min int, max int, key string) error {
+	v, err := strconv.Atoi(value)
+	if err != nil || v < min || v > max {
+		return fmt.Errorf("%s must be between %d and %d", key, min, max)
+	}
+	return nil
+}
+
+func validateInt64Min(value string, min int64, key string) error {
+	v, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || v < min {
+		return fmt.Errorf("%s must be >= %d", key, min)
+	}
+	return nil
+}
+
+func validateOptionalInt64Min(value string, min int64, key string) error {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	v, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || v < min {
+		return fmt.Errorf("%s must be empty or >= %d", key, min)
+	}
+	return nil
+}
+
+func validateOptionalIntZeroOrMinMax(value string, min int, max int, key string) error {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	v, err := strconv.Atoi(value)
+	if err != nil || v < 0 || (v > 0 && (v < min || v > max)) {
+		return fmt.Errorf("%s must be empty, 0, or between %d and %d", key, min, max)
+	}
+	return nil
+}
+
+func validateFloatMinMax(value string, min float64, max float64, key string) error {
+	v, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+	if err != nil || v < min || v > max {
+		return fmt.Errorf("%s must be between %g and %g", key, min, max)
+	}
+	return nil
+}
+
+func validateStringMax(value string, max int, key string) error {
+	if len([]rune(value)) > max {
+		return fmt.Errorf("%s length must be <= %d", key, max)
+	}
+	return nil
+}
+
+func validateOptionalHTTPURL(value string, key string) error {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	if !strings.HasPrefix(value, "http://") && !strings.HasPrefix(value, "https://") {
+		return fmt.Errorf("%s must start with http:// or https://", key)
+	}
+	return nil
+}
+
+func buildValidSettingKeys() map[string]struct{} {
+	result := make(map[string]struct{})
+	for _, item := range defaultSettings() {
+		result[item.Namespace+":"+item.Key] = struct{}{}
+	}
+	return result
+}

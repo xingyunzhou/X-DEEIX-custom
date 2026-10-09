@@ -1,0 +1,1075 @@
+"use client";
+
+import { ChevronDown, CircleAlert, FileCode2, FileDiff, Film, FolderArchive, GalleryHorizontalEnd, Trash2 } from "lucide-react";
+import { useTranslations } from "next-intl";
+import * as React from "react";
+import { GrainientBackground } from "@/components/reactbits/backgrounds/grainient";
+import {
+  Accordion,
+  AccordionContent,
+  AccordionItem,
+} from "@/components/ui/accordion";
+import {
+  Alert,
+  AlertDescription,
+} from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Textarea } from "@/components/ui/textarea";
+import { MessageAgentGroupTrace } from "@/features/agent-groups/components/message-agent-group-trace";
+import { useAgentGroupStepActions } from "@/features/agent-groups/hooks/use-agent-group-step-actions";
+import {
+  clearLiveGroupRun,
+  type GroupRunState,
+  readLiveGroupRun,
+  resolveRetryableGroupStep,
+  useLiveGroupRun,
+} from "@/features/agent-groups/model/group-run-store";
+import { MessageAttachmentRow } from "@/features/chat/components/message/message-attachment";
+import { MessageKnowledgeSources } from "@/features/chat/components/message/message-knowledge-sources";
+import type { AssistantReaction } from "@/features/chat/components/message/message-meta";
+import { AssistantMessageMeta } from "@/features/chat/components/message/message-meta";
+import { MessageProcessTrace, MessageTraceEventBlocks } from "@/features/chat/components/message/message-process-trace";
+import { MessageSavedArtifactCards } from "@/features/chat/components/message/message-tool-trace";
+import { PlatformToolApprovalCard } from "@/features/chat/components/message/platform-tool-approval-card";
+import { type ProjectChange, projectChanges } from "@/features/chat/components/sections/chat-project-workspace";
+import { resolveLeadingImagePreview } from "@/features/chat/model/media-image-preview";
+import { collectSavedArtifactTraceItems } from "@/features/chat/model/message-process-trace";
+import {
+  clearLiveUpstreamThinkTrace,
+  mergeLiveUpstreamThinkTrace,
+  shouldClearLiveUpstreamThinkTrace,
+  useLiveUpstreamThinkTrace,
+} from "@/features/chat/model/upstream-think-store";
+import type {
+  ChatAreaMessage,
+  ChatInlineAlert,
+  MessageAttachment,
+} from "@/features/chat/types/messages";
+import { isUpstreamStreamingDebugBody, summarizeUpstreamError } from "@/features/chat/utils/chat-runtime";
+import { useLocalizedErrorMessage } from "@/i18n/use-localized-error";
+import { cn } from "@/lib/utils";
+import { type FileContentResult, fetchFileContent } from "@/shared/api/file";
+import { resolveAccessToken } from "@/shared/auth/resolve-access-token";
+import type { FileContentLoader, PreviewDialogFile } from "@/shared/components/file-preview/preview-dialog";
+import { registerSignedMarkdownImageURL } from "@/shared/lib/markdown-image-source";
+import { PreviewMedia } from "@/shared/components/file-preview/preview-media";
+import { type MarkdownArtifactActions, MarkdownImage } from "@/shared/components/markdown/streamdown-components";
+import { StreamdownRender } from "@/shared/components/markdown/streamdown-render";
+import { MediaActionBar, MediaActionButton } from "@/shared/components/media-action-bar";
+import { useBranding } from "@/shared/config/branding-provider";
+import type { BillingDisplayCurrency } from "@/shared/lib/billing-display";
+
+const EMPTY_TRACE_EVENTS: NonNullable<NonNullable<ChatAreaMessage["processTrace"]>["events"]> = [];
+
+function isEditableImageAttachment(attachment: MessageAttachment): boolean {
+  const mimeType = attachment.mimeType.toLowerCase();
+  const detectedMime = attachment.detectedMime?.toLowerCase() || "";
+  return (
+    attachment.kind === "image" ||
+    attachment.fileCategory === "image" ||
+    mimeType.startsWith("image/") ||
+    detectedMime.startsWith("image/")
+  );
+}
+
+function isVideoAttachment(attachment: MessageAttachment): boolean {
+  const mimeType = attachment.mimeType.toLowerCase();
+  const detectedMime = attachment.detectedMime?.toLowerCase() || "";
+  return (
+    attachment.fileCategory === "video" ||
+    mimeType.startsWith("video/") ||
+    detectedMime.startsWith("video/")
+  );
+}
+
+function isAudioAttachment(attachment: MessageAttachment): boolean {
+  const mimeType = attachment.mimeType.toLowerCase();
+  const detectedMime = attachment.detectedMime?.toLowerCase() || "";
+  return (
+    attachment.kind === "audio" ||
+    attachment.fileCategory === "audio" ||
+    mimeType.startsWith("audio/") ||
+    detectedMime.startsWith("audio/")
+  );
+}
+
+function resolveInlineMediaKind(attachment: MessageAttachment): "image" | "audio" | "video" | null {
+  if (isEditableImageAttachment(attachment)) return "image";
+  if (isVideoAttachment(attachment)) return "video";
+  if (isAudioAttachment(attachment)) return "audio";
+  return null;
+}
+
+function isMP4VideoAttachment(attachment: MessageAttachment): boolean {
+  const mimeType = attachment.mimeType.toLowerCase();
+  const detectedMime = attachment.detectedMime?.toLowerCase() || "";
+  return (
+    mimeType === "video/mp4" ||
+    detectedMime === "video/mp4" ||
+    attachment.fileName.toLowerCase().endsWith(".mp4")
+  );
+}
+
+function resolveFileIDFromImageSrc(src: string): string | null {
+  try {
+    const pathname = src.startsWith("http://") || src.startsWith("https://") ? new URL(src).pathname : src;
+    const match = pathname.match(/\/api\/v1\/files\/([^/?#]+)\/content(?:[?#].*)?$/);
+    return match?.[1] ? decodeURIComponent(match[1]) : null;
+  } catch {
+    return null;
+  }
+}
+
+// 收集正文 markdown 图片引用的文件 ID（/api/v1/files/<id>/content）。
+// image_gen 等工具会把生成图同时挂为消息附件并让模型回显 markdown 引用，
+// 该集合用于避免同一张图被"正文内联图 + 附件预览/卡片"重复渲染。
+function collectMarkdownImageFileIDs(content: string): Set<string> {
+  const fileIDs = new Set<string>();
+  const imageMarkdownRe = /!\[[^\]]*]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
+  for (const match of content.matchAll(imageMarkdownRe)) {
+    const fileID = resolveFileIDFromImageSrc(match[1] || "");
+    if (fileID) {
+      fileIDs.add(fileID);
+    }
+  }
+  return fileIDs;
+}
+
+function isGeneratedVideoMarkdownContent(content: string, attachments: MessageAttachment[]): boolean {
+  const blocks = content
+    .trim()
+    .split(/\n{2,}/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  if (blocks.length === 0) {
+    return false;
+  }
+
+  const videoFileIDs = new Set(attachments.filter(isVideoAttachment).map((attachment) => attachment.fileID));
+  if (videoFileIDs.size === 0) {
+    return false;
+  }
+
+  return blocks.every((block) => {
+    const match = block.match(/^\[Generated video(?: \d+)?\]\(\/api\/v1\/files\/([^/)]+)\/content\)$/);
+    return Boolean(match?.[1] && videoFileIDs.has(match[1]));
+  });
+}
+
+function resolveEditableImageAttachment(
+  src: string,
+  attachments: MessageAttachment[],
+  contentType: string | undefined,
+): MessageAttachment | null {
+  if (attachments.length === 0) {
+    return null;
+  }
+
+  const fileID = resolveFileIDFromImageSrc(src);
+  if (fileID) {
+    return attachments.find((attachment) => attachment.fileID === fileID) ?? null;
+  }
+
+  if (contentType === "image" && attachments.length === 1) {
+    return attachments[0];
+  }
+
+  return null;
+}
+
+type ChatMessageBotProps = {
+  item: ChatAreaMessage;
+  busy?: boolean;
+  reaction: AssistantReaction;
+  onRetryAssistantMessage: (message: ChatAreaMessage) => Promise<void> | void;
+  onContinueAssistantMessage?: (message: ChatAreaMessage) => Promise<void> | void;
+  onEditAssistantMessage: (message: ChatAreaMessage, content: string) => Promise<boolean> | boolean;
+  onForkMessage?: (message: ChatAreaMessage) => Promise<void> | void;
+  onDeleteMessage?: (message: ChatAreaMessage) => Promise<void> | void;
+  onCycleMessageBranch: (parentPublicID: string | null, direction: "previous" | "next") => void;
+  onReactAssistantMessage: (publicID: string, reaction: AssistantReaction) => void;
+  onPlatformToolApprovalResolved?: () => void;
+  onCopy: () => void;
+  copySucceeded?: boolean;
+  markdownRender?: boolean;
+  showModelInfo?: boolean;
+  showLatency?: boolean;
+  showTokenUsage?: boolean;
+  showBillingCost?: boolean;
+  showProcessTrace?: boolean;
+  billingDisplayCurrency?: BillingDisplayCurrency;
+  billingDisplayUsdToCnyRate?: number | null;
+  readOnly?: boolean;
+  attachmentContentLoader?: FileContentLoader;
+  onEditImageAttachment?: (attachment: MessageAttachment, sourceModelName?: string) => void;
+  onExtendVideoAttachment?: (attachment: MessageAttachment, sourceModelName?: string) => void;
+  onOpenProjectChange?: (change: ProjectChange) => void;
+  artifactActions?: MarkdownArtifactActions;
+  showBranchNavigator?: boolean;
+  contentWidthClassName?: string;
+  screenshotMeta?: React.ReactNode;
+  /** 分享页等无实时流的场景：静态群组运行时间线（无则回退实时 store）。 */
+  staticGroupRun?: GroupRunState | null;
+};
+
+export function ChatMessageBot({
+  item,
+  busy = false,
+  reaction,
+  onRetryAssistantMessage,
+  onContinueAssistantMessage,
+  onEditAssistantMessage,
+  onForkMessage,
+  onDeleteMessage,
+  onCycleMessageBranch,
+  onReactAssistantMessage,
+  onPlatformToolApprovalResolved,
+  onCopy,
+  copySucceeded = false,
+  markdownRender = true,
+  showModelInfo = true,
+  showLatency = true,
+  showTokenUsage = true,
+  showBillingCost = false,
+  showProcessTrace = true,
+  billingDisplayCurrency = "USD",
+  billingDisplayUsdToCnyRate = null,
+  readOnly = false,
+  attachmentContentLoader,
+  onEditImageAttachment,
+  onExtendVideoAttachment,
+  onOpenProjectChange,
+  artifactActions,
+  showBranchNavigator = true,
+  contentWidthClassName = "max-w-[1080px]",
+  screenshotMeta,
+  staticGroupRun = null,
+}: ChatMessageBotProps) {
+  const tCommon = useTranslations("common.actions");
+  const submitT = useTranslations("chat.submit");
+  const [isEditing, setIsEditing] = React.useState(false);
+  const [editingValue, setEditingValue] = React.useState(item.content);
+  const onContinue = React.useCallback(() => {
+    void onContinueAssistantMessage?.(item);
+  }, [item, onContinueAssistantMessage]);
+  const onFork = React.useCallback(
+    () => onForkMessage?.(item),
+    [item, onForkMessage],
+  );
+  const onDelete = React.useCallback(() => onDeleteMessage?.(item), [item, onDeleteMessage]);
+  const onEditSave = React.useCallback(async () => {
+    const nextContent = editingValue.trim();
+    if (!nextContent || nextContent === item.content.trim()) {
+      return;
+    }
+    const ok = await onEditAssistantMessage(item, nextContent);
+    if (ok !== false) {
+      setIsEditing(false);
+    }
+  }, [editingValue, item, onEditAssistantMessage]);
+  React.useEffect(() => {
+    setIsEditing(false);
+  }, [item.publicID]);
+  React.useEffect(() => {
+    if (!isEditing) {
+      setEditingValue(item.content);
+    }
+  }, [isEditing, item.content]);
+  const liveProcessTrace = useLiveUpstreamThinkTrace(item.runID);
+  const processTrace =
+    liveProcessTrace
+      ? mergeLiveUpstreamThinkTrace(item.processTrace, liveProcessTrace)
+      : item.processTrace;
+  React.useEffect(() => {
+    if (shouldClearLiveUpstreamThinkTrace(Boolean(item.isStreaming), item.processTrace, liveProcessTrace)) {
+      clearLiveUpstreamThinkTrace(item.runID);
+    }
+  }, [item.isStreaming, item.processTrace, item.runID, liveProcessTrace]);
+  // 实时流优先；分享页等无流场景回退静态时间线（后端分享快照重建）。
+  const liveGroupRun = useLiveGroupRun(item.runID) ?? staticGroupRun ?? undefined;
+  // 群组会话（§16.10）：运行暂停可重试时，meta 重试按钮原地重试失败步骤；
+  // 无目标步骤（非群组 / 运行未暂停）时回退到常规重试语义。
+  const retryableGroupStep = React.useMemo(() => {
+    if (!liveGroupRun || liveGroupRun.status !== "paused_retryable") {
+      return undefined;
+    }
+    return resolveRetryableGroupStep(liveGroupRun);
+  }, [liveGroupRun]);
+  const groupStepActions = useAgentGroupStepActions({
+    clientRunID: item.runID ?? "",
+    run: liveGroupRun,
+    step: retryableGroupStep,
+  });
+  const onRetry = React.useCallback(() => {
+    if (retryableGroupStep) {
+      void groupStepActions.handleRetry();
+      return;
+    }
+    void onRetryAssistantMessage(item);
+  }, [groupStepActions.handleRetry, item, onRetryAssistantMessage, retryableGroupStep]);
+  React.useEffect(() => {
+    // 群组运行：流结束后运行仍停留在 pending/running（中断/取消）时清理占位；
+    // 终态运行（completed/abandoned/paused_retryable/blocked）保留时间线。
+    if (item.isStreaming) {
+      return;
+    }
+    const run = readLiveGroupRun(item.runID);
+    if (run && (run.status === "pending" || run.status === "running") && run.steps.length === 0 && !run.groupRunID) {
+      clearLiveGroupRun(item.runID);
+    }
+  }, [item.isStreaming, item.runID]);
+  const upstreamThink = processTrace?.upstreamThink;
+  const toolTrace = processTrace?.tools;
+  const traceEvents = processTrace?.events ?? EMPTY_TRACE_EVENTS;
+  const savedArtifacts = React.useMemo(
+    () =>
+      collectSavedArtifactTraceItems([
+        ...traceEvents.map((event) => event.payloadJson),
+        toolTrace?.payloadJson,
+      ]),
+    [toolTrace?.payloadJson, traceEvents],
+  );
+  const messageStreaming = Boolean(item.isStreaming);
+  const renderableMediaAttachments = React.useMemo(
+    () =>
+      item.isStreaming
+        ? []
+        : (item.attachments ?? []).filter(
+            (attachment) => resolveInlineMediaKind(attachment) !== null,
+          ),
+    [item.attachments, item.isStreaming],
+  );
+  const primaryVideoAttachment =
+    renderableMediaAttachments.find(isVideoAttachment) ?? null;
+  const hideGeneratedVideoMarkdown = primaryVideoAttachment
+    ? isGeneratedVideoMarkdownContent(item.content, item.attachments ?? [])
+    : false;
+  const renderableContent = hideGeneratedVideoMarkdown ? "" : item.content;
+  const hasStreamdownContent = renderableContent.trim().length > 0;
+  // 仅在 markdown 渲染开启时收集：关闭时正文按纯文本展示，附件预览是唯一图片出口。
+  const contentImageFileIDs = React.useMemo(
+    () => (markdownRender ? collectMarkdownImageFileIDs(renderableContent) : new Set<string>()),
+    [markdownRender, renderableContent],
+  );
+  const leadingImagePreview = React.useMemo(() => resolveLeadingImagePreview(renderableContent), [renderableContent]);
+  const leadingImageFileID = React.useMemo(
+    () => (leadingImagePreview?.source ? resolveFileIDFromImageSrc(leadingImagePreview.source) : null),
+    [leadingImagePreview?.source],
+  );
+  const inlineMediaAttachments = React.useMemo(
+    () =>
+      renderableMediaAttachments.filter(
+        (attachment) =>
+          !(
+            leadingImageFileID &&
+            isEditableImageAttachment(attachment) &&
+            attachment.fileID === leadingImageFileID
+          ) &&
+          !(
+            isEditableImageAttachment(attachment) &&
+            contentImageFileIDs.has(attachment.fileID)
+          ),
+      ),
+    [contentImageFileIDs, leadingImageFileID, renderableMediaAttachments],
+  );
+  const visibleAttachments = React.useMemo(() => {
+    const attachments = item.attachments ?? [];
+    if (inlineMediaAttachments.length === 0 && contentImageFileIDs.size === 0) {
+      return attachments;
+    }
+    const hiddenFileIDs = new Set([
+      ...inlineMediaAttachments.map((attachment) => attachment.fileID),
+      ...contentImageFileIDs,
+    ]);
+    return attachments.filter((attachment) => !hiddenFileIDs.has(attachment.fileID));
+  }, [contentImageFileIDs, inlineMediaAttachments, item.attachments]);
+  const leadingImageAlt = React.useMemo(
+    () => leadingImagePreview?.alt || submitT("imagePreviewAlt"),
+    [leadingImagePreview?.alt, submitT],
+  );
+  const leadingImageReady = Boolean(leadingImagePreview?.complete);
+  const leadingImagePending = Boolean(leadingImagePreview && item.isStreaming && !leadingImagePreview.complete);
+  const streamdownContent = leadingImagePreview?.rest ?? renderableContent;
+  const hasInlineContent = streamdownContent.trim().length > 0;
+  const postProcessEvents = React.useMemo(
+    () =>
+      traceEvents.filter(
+        (event) =>
+          event.phase === "tools" ||
+          event.phase === "upstream_think" ||
+          event.eventType === "tool" ||
+          event.eventType === "think",
+      ),
+    [traceEvents],
+  );
+  const hasTraceEvents = postProcessEvents.length > 0;
+  const hasTraceBlocks = hasTraceEvents || Boolean(upstreamThink) || Boolean(toolTrace);
+  const isImageGenerationLoading = item.contentType === "image" && item.isStreaming && !hasStreamdownContent;
+  const isVideoGenerationLoading = item.contentType === "video" && item.isStreaming && !hasStreamdownContent;
+  const editableImageAttachments = React.useMemo(
+    () => (item.attachments ?? []).filter(isEditableImageAttachment),
+    [item.attachments],
+  );
+  // 把附件携带的签名缩略图地址注册给 markdown 图片加载器：
+  // 消息内容里 /files/{id}/content 引用渲染时直连签名 URL，免鉴权全量拉取。
+  React.useEffect(() => {
+    for (const attachment of item.attachments ?? []) {
+      if (!attachment.signedPreviewURL && !attachment.signedThumbnailURL) {
+        continue;
+      }
+      registerSignedMarkdownImageURL(attachment.fileID, attachment.signedPreviewURL ?? attachment.signedThumbnailURL);
+    }
+  }, [item.attachments]);
+  const getEditableImageAttachment = React.useCallback(
+    (src: string) => resolveEditableImageAttachment(src, editableImageAttachments, item.contentType),
+    [editableImageAttachments, item.contentType],
+  );
+  const markdownImageActions = React.useMemo(() => {
+    if (readOnly || !onEditImageAttachment || editableImageAttachments.length === 0) {
+      return undefined;
+    }
+    return {
+      canEditImage: (src: string) => Boolean(getEditableImageAttachment(src)),
+      onEditImage: (src: string) => {
+        const attachment = getEditableImageAttachment(src);
+        if (attachment) {
+          onEditImageAttachment(attachment, item.platformModelName);
+        }
+      },
+    };
+  }, [
+    editableImageAttachments.length,
+    getEditableImageAttachment,
+    item.platformModelName,
+    onEditImageAttachment,
+    readOnly,
+  ]);
+  const processAutoCollapseReady = Boolean(hasTraceBlocks || hasStreamdownContent || item.inlineAlert);
+  const changes = React.useMemo(() => projectChanges([item]), [item]);
+
+  if (!readOnly && isEditing) {
+    const nextContent = editingValue.trim();
+    const unchanged = nextContent === item.content.trim();
+
+    return (
+      <div className="flex justify-start">
+        <div className={cn("w-full rounded-lg bg-muted/40 p-3 text-foreground", contentWidthClassName)}>
+          <Textarea
+            autoFocus
+            value={editingValue}
+            className="chat-font-content min-h-[160px] resize-none rounded-lg border-border border-[0.5px] bg-background px-3 py-2 text-sm leading-7 shadow-none focus-visible:border-primary focus-visible:ring-0"
+            style={{ fontFamily: "var(--font-chat)", fontWeight: "var(--font-chat-weight)" }}
+            onChange={(event) => setEditingValue(event.target.value)}
+          />
+          <div className="mt-3 flex items-center justify-end gap-2">
+            <Button
+              variant="ghost"
+              className="rounded-lg text-xs font-medium"
+              onClick={() => setIsEditing(false)}
+            >
+              {tCommon("cancel")}
+            </Button>
+            <Button
+              variant="default"
+              className="rounded-lg text-xs font-medium shadow-none hover:bg-primary/60"
+              disabled={busy || nextContent.length === 0 || unchanged}
+              onClick={() => void onEditSave()}
+            >
+              {tCommon("save")}
+            </Button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="group/assistant-message flex w-full flex-col items-start">
+      {showProcessTrace ? (
+        <MessageProcessTrace
+          trace={processTrace}
+          active={messageStreaming}
+          autoCollapseReady={processAutoCollapseReady}
+        />
+      ) : null}
+      <MessageTraceEventBlocks
+        events={postProcessEvents}
+        activeToolBlock={toolTrace}
+        activeThinkBlock={upstreamThink}
+        messageStreaming={messageStreaming}
+        autoCollapseReady={hasStreamdownContent || Boolean(item.inlineAlert)}
+      />
+      <PlatformToolApprovalCard
+        tracePayloadJson={toolTrace?.payloadJson}
+        onResolved={onPlatformToolApprovalResolved}
+      />
+      <MessageAgentGroupTrace
+        run={liveGroupRun}
+        streaming={messageStreaming}
+        clientRunID={item.runID ?? ""}
+        readOnly={Boolean(readOnly)}
+      />
+
+      <div
+        data-chat-assistant-content=""
+        className="w-full min-w-0 max-w-none overflow-hidden text-[15px] leading-8 text-foreground [overflow-wrap:anywhere]"
+        style={{ fontFamily: "var(--font-chat)", fontWeight: "var(--font-chat-weight)" }}
+      >
+        {isImageGenerationLoading && !item.inlineAlert ? (
+          <AssistantImageGenerationSkeleton label={item.activityLabel} aspectRatio={item.imageAspectRatio} />
+        ) : isVideoGenerationLoading && !item.inlineAlert ? (
+          <AssistantVideoGenerationSkeleton label={item.activityLabel} />
+        ) : item.isStreaming && !hasStreamdownContent && !item.inlineAlert ? (
+          <AssistantMessageSkeleton fileProc={item.isFileProc} label={item.activityLabel} />
+        ) : leadingImagePending ? (
+          <AssistantImageGenerationSkeleton label={leadingImageAlt} aspectRatio={item.imageAspectRatio} />
+        ) : leadingImagePreview && leadingImageReady ? (
+          <>
+            <MarkdownImage alt={leadingImageAlt} src={leadingImagePreview.source} />
+            {hasInlineContent && markdownRender ? (
+              <StreamdownRender
+                content={streamdownContent}
+                streaming={Boolean(item.isStreaming)}
+                imageActions={markdownImageActions}
+                artifactActions={artifactActions}
+              />
+            ) : hasInlineContent ? (
+              <p className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{streamdownContent}</p>
+            ) : null}
+          </>
+        ) : hasStreamdownContent && markdownRender ? (
+          <StreamdownRender
+            content={streamdownContent}
+            streaming={Boolean(item.isStreaming)}
+            imageActions={markdownImageActions}
+            artifactActions={artifactActions}
+          />
+        ) : hasStreamdownContent ? (
+          <p className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{item.content}</p>
+        ) : null}
+        <MessageSavedArtifactCards
+          artifacts={savedArtifacts}
+          className={hasStreamdownContent ? "mt-3" : undefined}
+        />
+      </div>
+
+      {changes.length > 0 && onOpenProjectChange ? (
+        <div className="my-3 w-full max-w-[34rem] space-y-1.5 rounded-lg border border-border/70 bg-muted/20 p-2.5">
+          <div className="flex items-center gap-2 px-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+            <FileDiff className="size-3.5" />
+            <span>Project changes</span>
+          </div>
+          {changes.map((change) => (
+            <button key={change.key} type="button" onClick={() => onOpenProjectChange(change)} className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors hover:bg-muted">
+              {change.name === "project_delete_file" ? <Trash2 className="size-3.5 text-destructive" /> : change.name === "project_create_archive" ? <FolderArchive className="size-3.5 text-muted-foreground" /> : <FileCode2 className="size-3.5 text-muted-foreground" />}
+              <span className="min-w-0 flex-1 truncate">{change.name === "project_create_archive" ? "项目 ZIP 归档 · 点击下载" : change.path}</span>
+              <span className="shrink-0 text-[10px] text-muted-foreground">{change.name === "project_create_archive" ? "archive" : change.parts && change.parts.length > 1 ? `${change.parts.length} 次修改` : change.name.replace("project_", "")}</span>
+            </button>
+          ))}
+        </div>
+      ) : null}
+
+      {inlineMediaAttachments.map((attachment) => {
+        const kind = resolveInlineMediaKind(attachment);
+        if (!kind) return null;
+        const canExtend =
+          kind === "video" &&
+          isMP4VideoAttachment(attachment) &&
+          Boolean(onExtendVideoAttachment);
+        return (
+          <MessageInlineMediaPreview
+            key={attachment.fileID}
+            attachment={attachment}
+            kind={kind}
+            loadContent={attachmentContentLoader}
+            onExtend={
+              canExtend
+                ? () => onExtendVideoAttachment?.(attachment, item.platformModelName)
+                : undefined
+            }
+          />
+        );
+      })}
+
+      {item.inlineAlert ? (
+        <ChatInlineAlertCard alert={item.inlineAlert} className={hasStreamdownContent ? "my-4" : "mb-4"} />
+      ) : null}
+
+      {visibleAttachments.length > 0 ? (
+        <div className="mt-2 flex w-full justify-start">
+          <MessageAttachmentRow
+            attachments={visibleAttachments}
+            loadContent={attachmentContentLoader}
+            allowDownload={!readOnly}
+            align="start"
+          />
+        </div>
+      ) : null}
+
+      {screenshotMeta}
+
+      <MessageKnowledgeSources
+        trace={processTrace}
+        sources={item.knowledgeSources}
+        streaming={messageStreaming}
+      />
+
+      <AssistantMessageMeta
+        item={item}
+        busy={busy}
+        reaction={reaction}
+        onCycleBranch={onCycleMessageBranch}
+        onRetry={onRetry}
+        retryBusy={groupStepActions.retrying}
+        onContinue={onContinueAssistantMessage ? onContinue : undefined}
+        onEdit={() => setIsEditing(true)}
+        onCopy={onCopy}
+        onFork={onForkMessage ? onFork : undefined}
+        onDelete={onDeleteMessage ? onDelete : undefined}
+        copySucceeded={copySucceeded}
+        onReact={(value) => onReactAssistantMessage(item.publicID, value)}
+        showModelInfo={showModelInfo}
+        showLatency={showLatency}
+        showTokenUsage={showTokenUsage}
+        showBillingCost={showBillingCost}
+        billingDisplayCurrency={billingDisplayCurrency}
+        billingDisplayUsdToCnyRate={billingDisplayUsdToCnyRate}
+        readOnly={readOnly}
+        alwaysVisible={readOnly}
+        showBranchNavigator={showBranchNavigator}
+      />
+    </div>
+  );
+}
+
+export function ChatInlineAlertCard({
+  alert,
+  className,
+}: {
+  alert: ChatInlineAlert;
+  className?: string;
+}) {
+  const t = useTranslations("chat.composer");
+  const details = alert.details;
+  const message = alert.message.trim();
+  const summary = summarizeUpstreamError(message, details, t("retryLater"));
+  const hasDetails = Boolean(details?.request || details?.response);
+  const [detailsOpen, setDetailsOpen] = React.useState(false);
+  const hasSuccessfulStreamDebug =
+    Boolean(summary.statusCode && summary.statusCode >= 200 && summary.statusCode < 300) &&
+    isUpstreamStreamingDebugBody(details?.response?.body || message);
+  const summaryText = hasSuccessfulStreamDebug
+    ? t("streamResponseParseFailed", { statusCode: summary.statusCode ?? 200 })
+    : [summary.statusCode ? `HTTP ${summary.statusCode}` : "", summary.reason].filter(Boolean).join(", ");
+  return (
+    <Alert className={cn("min-w-0 max-w-full overflow-hidden", className)} variant="destructive">
+      <CircleAlert className="size-4" />
+      <button
+        type="button"
+        disabled={!hasDetails}
+        aria-expanded={hasDetails ? detailsOpen : undefined}
+        className={cn(
+          "col-start-2 flex w-full min-w-0 max-w-full items-start gap-3 text-left",
+          "rounded-sm outline-none transition-colors focus-visible:ring-[3px] focus-visible:ring-ring/35",
+          hasDetails ? "cursor-pointer hover:text-destructive" : "cursor-default",
+        )}
+        onClick={() => {
+          if (hasDetails) {
+            setDetailsOpen((open) => !open);
+          }
+        }}
+      >
+        <span className="min-w-0 flex-1">
+          <span className="block min-h-4 truncate font-medium tracking-tight">{alert.title}</span>
+          <span className="mt-0.5 block whitespace-normal break-words text-sm leading-relaxed text-destructive/90 [overflow-wrap:anywhere]">
+            {summaryText}
+          </span>
+        </span>
+        {hasDetails ? (
+          <ChevronDown className={cn("mt-0.5 size-4 shrink-0 text-destructive/70 transition-transform", detailsOpen && "rotate-180")} />
+        ) : null}
+      </button>
+      {hasDetails ? (
+        <AlertDescription className="w-full min-w-0 max-w-full justify-self-stretch justify-items-stretch break-words [overflow-wrap:anywhere]">
+          <UpstreamExchangeDetails details={details} open={detailsOpen} onOpenChange={setDetailsOpen} />
+        </AlertDescription>
+      ) : null}
+    </Alert>
+  );
+}
+
+function UpstreamExchangeDetails({
+  details,
+  open,
+  onOpenChange,
+}: {
+  details?: ChatInlineAlert["details"];
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const t = useTranslations("chat.messages");
+
+  return (
+    <Accordion
+      type="single"
+      collapsible
+      value={open ? "upstream-debug" : ""}
+      onValueChange={(value) => onOpenChange(value === "upstream-debug")}
+      className="w-full min-w-0 max-w-full text-xs text-foreground"
+    >
+      <AccordionItem value="upstream-debug" className="w-full min-w-0 max-w-full border-b-0">
+        <AccordionContent className="w-full min-w-0 max-w-full pb-0 pt-3">
+          <Tabs defaultValue="request" className="min-w-0 w-full max-w-full overflow-hidden">
+            <TabsList className="h-7 gap-1">
+              <TabsTrigger value="request">{t("debugRequest")}</TabsTrigger>
+              <TabsTrigger value="response">{t("debugResponse")}</TabsTrigger>
+            </TabsList>
+            <TabsContent value="request" className="min-w-0 w-full max-w-full overflow-hidden">
+              <DebugCodeBlock value={rawRequestBody(details)} />
+            </TabsContent>
+            <TabsContent value="response" className="min-w-0 w-full max-w-full overflow-hidden">
+              <DebugCodeBlock value={rawResponseBody(details)} />
+            </TabsContent>
+          </Tabs>
+        </AccordionContent>
+      </AccordionItem>
+    </Accordion>
+  );
+}
+
+function rawRequestBody(details?: ChatInlineAlert["details"]): string {
+  return details?.request?.body ?? "";
+}
+
+function rawResponseBody(details?: ChatInlineAlert["details"]): string {
+  return details?.response?.body ?? "";
+}
+
+function DebugCodeBlock({ value }: { value: string }) {
+  return (
+    <pre className="block max-h-96 min-w-0 w-full max-w-full justify-self-stretch overflow-y-auto overflow-x-hidden rounded-md bg-muted/45 px-4 py-3 text-[12px] leading-6 whitespace-pre-wrap break-words text-foreground [overflow-wrap:anywhere]">
+      <code>{formatDebugValue(value)}</code>
+    </pre>
+  );
+}
+
+function formatDebugValue(value: string): string {
+  const raw = value.trim();
+  if (!raw) {
+    return "";
+  }
+  const parsedSSE = formatSSEData(raw);
+  if (parsedSSE) {
+    return parsedSSE;
+  }
+  return formatJSON(raw);
+}
+
+function formatSSEData(value: string): string {
+  if (!/(^|\n)data:\s*/.test(value)) {
+    return "";
+  }
+  const payloads = value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice("data:".length).trim())
+    .filter((line) => line && line !== "[DONE]");
+  if (payloads.length === 0) {
+    return value;
+  }
+  return payloads.map(formatJSON).join("\n\n");
+}
+
+function formatJSON(value: string): string {
+  try {
+    return JSON.stringify(JSON.parse(value), null, 2);
+  } catch {
+    return value;
+  }
+}
+
+export function AssistantMessageSkeleton({ fileProc, label }: { fileProc?: boolean; label?: string } = {}) {
+  const t = useTranslations("chat.messages");
+  if (fileProc) {
+    return (
+      <div className="flex items-center gap-2 pt-1 text-[13px] text-muted-foreground">
+        <span className="inline-block size-3.5 animate-spin rounded-full border-2 border-muted border-t-foreground/50" />
+        {label?.trim() || t("processing")}
+      </div>
+    );
+  }
+  return (
+    <div className="w-full max-w-[680px] space-y-2.5 pt-1">
+      <Skeleton className="h-4 w-[72%] rounded-full bg-muted/35" />
+      <Skeleton className="h-4 w-[96%] rounded-full bg-muted/35" />
+      <Skeleton className="h-4 w-[88%] rounded-full bg-muted/35" />
+      <Skeleton className="h-4 w-[64%] rounded-full bg-muted/35" />
+    </div>
+  );
+}
+
+export function AssistantImageGenerationSkeleton({
+  label,
+  aspectRatio = "wide",
+}: {
+  label?: string;
+  aspectRatio?: ChatAreaMessage["imageAspectRatio"];
+}) {
+  const t = useTranslations("chat.messages");
+  const branding = useBranding();
+  const frameClassName =
+    aspectRatio === "portrait" ? "max-w-[18rem]" : aspectRatio === "square" ? "max-w-[24rem]" : "max-w-[32rem]";
+  const aspectClassName =
+    aspectRatio === "portrait" ? "aspect-[9/16]" : aspectRatio === "square" ? "aspect-square" : "aspect-video";
+  return (
+    <div className={cn("my-4 w-full space-y-2.5", frameClassName)}>
+      <div className="flex items-center gap-2 pt-1 text-[13px] text-muted-foreground">
+        <span className="inline-block size-3.5 animate-spin rounded-full border-2 border-muted border-t-foreground/50" />
+        {label?.trim() || t("processing")}
+      </div>
+      <div className={cn("relative w-full overflow-hidden rounded-xl bg-muted/20 text-primary", aspectClassName)}>
+        <GrainientBackground
+          className="absolute inset-0 text-primary/75"
+          color1="#BAE6FD"
+          color2="#60A5FA"
+          color3="#A78BFA"
+          contrast={1.48}
+          saturation={1.0}
+          timeSpeed={2.6}
+          warpAmplitude={72}
+          warpSpeed={2.1}
+        />
+        <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+          <span className="select-none text-[clamp(1.75rem,7vw,4rem)] font-semibold tracking-[0.18em] text-white/30 mix-blend-overlay drop-shadow-sm">
+            {branding.shortName}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function AssistantVideoGenerationSkeleton({ label }: { label?: string }) {
+  const t = useTranslations("chat.messages");
+  const branding = useBranding();
+  return (
+    <div className="my-4 w-full max-w-[32rem] space-y-2.5">
+      <div className="flex items-center gap-2 pt-1 text-[13px] text-muted-foreground">
+        <span className="inline-block size-3.5 animate-spin rounded-full border-2 border-muted border-t-foreground/50" />
+        {label?.trim() || t("processing")}
+      </div>
+      <div className="relative aspect-video w-full overflow-hidden rounded-xl bg-muted/20 text-primary">
+        <GrainientBackground
+          className="absolute inset-0 text-primary/75"
+          color1="#FDE68A"
+          color2="#FDA4AF"
+          color3="#FB7185"
+          contrast={1.48}
+          saturation={1.0}
+          timeSpeed={2.6}
+          warpAmplitude={72}
+          warpSpeed={2.1}
+        />
+        <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+          <div className="flex flex-col items-center gap-5 text-white/30 mix-blend-overlay drop-shadow-sm">
+            <Film className="size-14" strokeWidth={1.4} />
+            <span className="select-none text-[clamp(1.75rem,7vw,4rem)] font-semibold tracking-[0.18em]">
+              {branding.shortName}
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+type InlineMediaPreviewState =
+  | { status: "loading" }
+  | { status: "error"; message: string }
+  | { status: "ready"; source: string; contentType: string };
+
+function InlineMediaLoadingPlaceholder({ kind }: { kind: "image" | "audio" | "video" }) {
+  if (kind === "audio") {
+    return <div className="my-4 h-10 w-full max-w-[36rem] animate-pulse rounded-md bg-muted/40" />;
+  }
+  return (
+    <div className="my-4 flex aspect-video w-full max-w-[40rem] items-center justify-center overflow-hidden rounded-xl bg-muted/20">
+      <span className="size-4 animate-spin rounded-full border-2 border-muted-foreground/20 border-t-muted-foreground/55" />
+    </div>
+  );
+}
+
+function useInlineMediaPreview(
+  {
+    attachment,
+    loadContent,
+  }: {
+    attachment: MessageAttachment;
+    loadContent?: FileContentLoader;
+  },
+) {
+  const tPreview = useTranslations("files.previewDialog");
+  const resolveErrorMessage = useLocalizedErrorMessage();
+  const objectURLRef = React.useRef<string | null>(null);
+  const fileID = attachment.fileID;
+  const fileName = attachment.fileName;
+  const mimeType = attachment.mimeType;
+  const detectedMime = attachment.detectedMime;
+  const previewURL = attachment.previewURL;
+  const sizeBytes = attachment.sizeBytes;
+  const [state, setState] = React.useState<InlineMediaPreviewState>(() =>
+    previewURL
+      ? {
+          status: "ready",
+          source: previewURL,
+          contentType: detectedMime || mimeType,
+        }
+      : { status: "loading" },
+  );
+  const revokeObjectURL = React.useCallback(() => {
+    if (!objectURLRef.current) {
+      return;
+    }
+    URL.revokeObjectURL(objectURLRef.current);
+    objectURLRef.current = null;
+  }, []);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    const controller = new AbortController();
+    revokeObjectURL();
+
+    if (previewURL) {
+      setState({
+        status: "ready",
+        source: previewURL,
+        contentType: detectedMime || mimeType,
+      });
+      return undefined;
+    }
+
+    setState({ status: "loading" });
+    void (async () => {
+      try {
+        const file = {
+          fileID,
+          fileName,
+          mimeType,
+          sizeBytes,
+        };
+        const result = loadContent
+          ? await loadContent(file, controller.signal)
+          : await (async () => {
+              const token = await resolveAccessToken();
+              if (!token) {
+                throw new Error(tPreview("sessionExpired"));
+              }
+              return fetchFileContent(token, fileID, controller.signal);
+            })();
+        const objectURL = URL.createObjectURL(result.blob);
+        objectURLRef.current = objectURL;
+
+        if (cancelled) {
+          URL.revokeObjectURL(objectURL);
+          if (objectURLRef.current === objectURL) {
+            objectURLRef.current = null;
+          }
+          return;
+        }
+
+        setState({
+          status: "ready",
+          source: objectURL,
+          contentType: result.contentType || detectedMime || mimeType,
+        });
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+        setState({ status: "error", message: resolveErrorMessage(error, tPreview("loadFailed")) });
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+      revokeObjectURL();
+    };
+  }, [
+    detectedMime,
+    fileID,
+    fileName,
+    loadContent,
+    mimeType,
+    previewURL,
+    resolveErrorMessage,
+    revokeObjectURL,
+    sizeBytes,
+    tPreview,
+  ]);
+
+  return state;
+}
+
+function MessageInlineMediaPreview({
+  attachment,
+  kind,
+  loadContent,
+  onExtend,
+}: {
+  attachment: MessageAttachment;
+  kind: "image" | "audio" | "video";
+  loadContent?: FileContentLoader;
+  onExtend?: () => void;
+}) {
+  const tMessages = useTranslations("chat.messages");
+  const state = useInlineMediaPreview({ attachment, loadContent });
+
+  if (state.status === "loading") {
+    return <InlineMediaLoadingPlaceholder kind={kind} />;
+  }
+
+  if (state.status === "error") {
+    return (
+      <Alert className="my-4 max-w-[36rem]" variant="destructive">
+        <CircleAlert className="size-4" />
+        <AlertDescription>{state.message}</AlertDescription>
+      </Alert>
+    );
+  }
+
+  if (kind === "audio") {
+    return (
+      <div className="my-4 w-full max-w-[36rem]">
+        {/* biome-ignore lint/a11y/useMediaCaption: generated audio has no transcript track available. */}
+        <audio controls preload="metadata" className="w-full" src={state.source}>
+          <a href={state.source} download={attachment.fileName}>
+            {attachment.fileName}
+          </a>
+        </audio>
+      </div>
+    );
+  }
+
+  return (
+    <div className="group relative my-4 w-full max-w-[40rem]">
+      <PreviewMedia
+        kind={kind}
+        source={state.source}
+        alt={attachment.fileName}
+        contentType={state.contentType}
+        inline
+      />
+      {kind === "video" && onExtend ? (
+        <MediaActionBar className="absolute right-2 top-2">
+          <MediaActionButton label={tMessages("extendVideo")} onClick={onExtend}>
+            <GalleryHorizontalEnd className="size-3.5" />
+          </MediaActionButton>
+        </MediaActionBar>
+      ) : null}
+    </div>
+  );
+}

@@ -1,0 +1,627 @@
+package channel
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net"
+	"net/http"
+	"testing"
+	"time"
+
+	domainchannel "github.com/DEEIX-AI/DEEIX-Chat/backend/internal/domain/channel"
+	"github.com/DEEIX-AI/DEEIX-Chat/backend/internal/infra/cache/memory"
+	"github.com/DEEIX-AI/DEEIX-Chat/backend/internal/infra/config"
+	"github.com/DEEIX-AI/DEEIX-Chat/backend/internal/infra/llm"
+	"github.com/DEEIX-AI/DEEIX-Chat/backend/internal/repository"
+)
+
+type routeResolutionRepositoryStub struct {
+	repository.ChannelRepository
+	model           domainchannel.PlatformModel
+	routes          []repository.ChannelUpstreamRouteRow
+	models          map[string]domainchannel.PlatformModel
+	routesByModel   map[string][]repository.ChannelUpstreamRouteRow
+	modelRows       []repository.ChannelModelListRow
+	breakerDefaults domainchannel.BreakerDefaults
+	breakerErr      error
+	breakerLoads    int
+}
+
+func (r *routeResolutionRepositoryStub) GetActiveModelByName(_ context.Context, name string) (*domainchannel.PlatformModel, error) {
+	if model, ok := r.models[name]; ok {
+		result := model
+		return &result, nil
+	}
+	model := r.model
+	return &model, nil
+}
+
+func (r *routeResolutionRepositoryStub) ListActiveRoutesByModel(_ context.Context, name string) ([]repository.ChannelUpstreamRouteRow, error) {
+	if routes, ok := r.routesByModel[name]; ok {
+		return append([]repository.ChannelUpstreamRouteRow(nil), routes...), nil
+	}
+	return append([]repository.ChannelUpstreamRouteRow(nil), r.routes...), nil
+}
+
+func (r *routeResolutionRepositoryStub) ListModels(context.Context, repository.ListChannelModelsInput) ([]repository.ChannelModelListRow, int64, error) {
+	return append([]repository.ChannelModelListRow(nil), r.modelRows...), int64(len(r.modelRows)), nil
+}
+
+func TestValidateModelRouteReferenceDoesNotRequireDynamicRouteSelection(t *testing.T) {
+	const encryptionKey = "test-data-encryption-key-32-bytes"
+	apiKeysEnc, err := encryptAPIKeys(encryptionKey, `{"strategy":"round_robin","keys":[{"key":"sk-test","status":"active"}]}`)
+	if err != nil {
+		t.Fatalf("encryptAPIKeys() error = %v", err)
+	}
+	repo := &routeResolutionRepositoryStub{
+		model: domainchannel.PlatformModel{
+			ID:                10,
+			PlatformModelName: "test-model",
+			AccessScope:       ModelAccessScopePublic,
+		},
+		routes: []repository.ChannelUpstreamRouteRow{{
+			RouteID:           1,
+			UpstreamModelID:   101,
+			UpstreamID:        201,
+			PlatformModelID:   10,
+			PlatformModelName: "test-model",
+			ModelKindsJSON:    `["chat"]`,
+			Protocol:          llm.AdapterOpenAIChatCompletions,
+			BaseURL:           "https://example.com/v1",
+			APIKeysEnc:        apiKeysEnc,
+			BindingCode:       "test-binding",
+			UpstreamModelName: "test-upstream-model",
+		}},
+	}
+	service := NewService(config.Config{DataEncryptionKey: encryptionKey}, repo, nil, nil, nil)
+
+	err = service.ValidateModelRouteReference(t.Context(), ResolveRouteInput{
+		PlatformModelName: "test-model",
+		TaskType:          TaskTypeChat,
+		Scope:             RouteScopeUser,
+		UserID:            11,
+	})
+	if err != nil {
+		t.Fatalf("ValidateModelRouteReference() error = %v", err)
+	}
+}
+
+func TestResolveDefaultModelSkipsStructurallyUnusableCandidate(t *testing.T) {
+	const encryptionKey = "test-data-encryption-key-32-bytes"
+	apiKeysEnc, err := encryptAPIKeys(encryptionKey, `{"strategy":"failover","keys":[{"key":"sk-test","status":"active"}]}`)
+	if err != nil {
+		t.Fatalf("encryptAPIKeys() error = %v", err)
+	}
+	first := domainchannel.PlatformModel{ID: 10, PlatformModelName: "first-model", AccessScope: ModelAccessScopePublic, Status: "active", KindsJSON: `["chat"]`}
+	second := domainchannel.PlatformModel{ID: 11, PlatformModelName: "second-model", AccessScope: ModelAccessScopePublic, Status: "active", KindsJSON: `["chat"]`}
+	repo := &routeResolutionRepositoryStub{
+		models: map[string]domainchannel.PlatformModel{
+			first.PlatformModelName:  first,
+			second.PlatformModelName: second,
+		},
+		modelRows: []repository.ChannelModelListRow{
+			{PlatformModel: first, ActiveSourceCount: 1},
+			{PlatformModel: second, ActiveSourceCount: 1},
+		},
+		routesByModel: map[string][]repository.ChannelUpstreamRouteRow{
+			first.PlatformModelName: {{
+				RouteID: 1, UpstreamModelID: 101, UpstreamID: 201, PlatformModelID: first.ID,
+				PlatformModelName: first.PlatformModelName, ModelKindsJSON: `["chat"]`, Protocol: "unsupported_adapter",
+				BaseURL: "https://first.example.com/v1", APIKeysEnc: apiKeysEnc, BindingCode: "first-binding", UpstreamModelName: "first-upstream-model",
+			}},
+			second.PlatformModelName: {{
+				RouteID: 2, UpstreamModelID: 102, UpstreamID: 202, PlatformModelID: second.ID,
+				PlatformModelName: second.PlatformModelName, ModelKindsJSON: `["chat"]`, Protocol: llm.AdapterOpenAIChatCompletions,
+				BaseURL: "https://second.example.com/v1", APIKeysEnc: apiKeysEnc, BindingCode: "second-binding", UpstreamModelName: "second-upstream-model",
+			}},
+		},
+	}
+	service := NewService(config.Config{DataEncryptionKey: encryptionKey}, repo, nil, nil, nil)
+
+	modelName, err := service.ResolveDefaultModel(t.Context(), ResolveRouteInput{
+		TaskType: TaskTypeChat,
+		Scope:    RouteScopeUser,
+		UserID:   11,
+	})
+	if err != nil {
+		t.Fatalf("ResolveDefaultModel() error = %v", err)
+	}
+	if modelName != second.PlatformModelName {
+		t.Fatalf("ResolveDefaultModel() = %q, want %q", modelName, second.PlatformModelName)
+	}
+}
+
+func (r *routeResolutionRepositoryStub) ListActiveRoutesByModelWithOwnership(ctx context.Context, name string, _ string, _ *uint) ([]repository.ChannelUpstreamRouteRow, error) {
+	return r.ListActiveRoutesByModel(ctx, name)
+}
+
+func (r *routeResolutionRepositoryStub) GetBreakerDefaults(context.Context) (domainchannel.BreakerDefaults, error) {
+	r.breakerLoads++
+	return r.breakerDefaults, r.breakerErr
+}
+
+func TestLoadBreakerDefaultsPreservesLastKnownGoodValueOnRefreshFailure(t *testing.T) {
+	repo := &routeResolutionRepositoryStub{breakerDefaults: domainchannel.BreakerDefaults{Enabled: true}}
+	service := &Service{repo: repo}
+
+	if !service.loadBreakerDefaults(t.Context()).Enabled {
+		t.Fatal("expected initial enabled breaker defaults")
+	}
+	repo.breakerErr = errors.New("database unavailable")
+	expireBreakerDefaultsCache(service)
+	if !service.loadBreakerDefaults(t.Context()).Enabled {
+		t.Fatal("expected refresh failure to preserve last known good breaker defaults")
+	}
+	if repo.breakerLoads != 2 {
+		t.Fatalf("breaker defaults loaded %d times, want 2", repo.breakerLoads)
+	}
+}
+
+func TestLoadBreakerDefaultsUsesShortLivedCache(t *testing.T) {
+	repo := &routeResolutionRepositoryStub{breakerDefaults: domainchannel.BreakerDefaults{Enabled: true}}
+	service := &Service{repo: repo}
+
+	if !service.loadBreakerDefaults(t.Context()).Enabled || !service.loadBreakerDefaults(t.Context()).Enabled {
+		t.Fatal("expected enabled breaker defaults")
+	}
+	if repo.breakerLoads != 1 {
+		t.Fatalf("breaker defaults loaded %d times, want 1", repo.breakerLoads)
+	}
+	expireBreakerDefaultsCache(service)
+	if !service.loadBreakerDefaults(t.Context()).Enabled || repo.breakerLoads != 2 {
+		t.Fatalf("expected invalidation to reload defaults, loads=%d", repo.breakerLoads)
+	}
+}
+
+func expireBreakerDefaultsCache(service *Service) {
+	service.breakerDefaultsMu.Lock()
+	service.breakerDefaultsValidUntil = time.Time{}
+	service.breakerDefaultsMu.Unlock()
+}
+
+func TestResolveRouteExcludesPreviouslyAttemptedRoutes(t *testing.T) {
+	const encryptionKey = "test-data-encryption-key-32-bytes"
+	apiKeysEnc, err := encryptAPIKeys(encryptionKey, `{"strategy":"failover","keys":[{"key":"sk-test","status":"active"}]}`)
+	if err != nil {
+		t.Fatalf("encryptAPIKeys() error = %v", err)
+	}
+
+	repo := &routeResolutionRepositoryStub{
+		model: domainchannel.PlatformModel{
+			ID:                10,
+			PlatformModelName: "test-model",
+			AccessScope:       ModelAccessScopePublic,
+		},
+		routes: []repository.ChannelUpstreamRouteRow{
+			{
+				RouteID:           1,
+				UpstreamModelID:   101,
+				UpstreamID:        201,
+				PlatformModelID:   10,
+				PlatformModelName: "test-model",
+				ModelKindsJSON:    `["chat"]`,
+				Protocol:          llm.AdapterOpenAIChatCompletions,
+				BaseURL:           "https://first.example.com/v1",
+				APIKeysEnc:        apiKeysEnc,
+				BindingCode:       "first-binding",
+				UpstreamModelName: "first-model",
+				Weight:            1,
+				RoutePriority:     1,
+			},
+			{
+				RouteID:           2,
+				UpstreamModelID:   102,
+				UpstreamID:        202,
+				PlatformModelID:   10,
+				PlatformModelName: "test-model",
+				ModelKindsJSON:    `["chat"]`,
+				Protocol:          llm.AdapterOpenAIChatCompletions,
+				BaseURL:           "https://second.example.com/v1",
+				APIKeysEnc:        apiKeysEnc,
+				BindingCode:       "second-binding",
+				UpstreamModelName: "second-model",
+				Weight:            1,
+				RoutePriority:     1,
+			},
+		},
+	}
+	service := NewService(
+		config.Config{DataEncryptionKey: encryptionKey},
+		repo,
+		nil,
+		memory.NewChannelCache(memory.New()),
+		nil,
+	)
+
+	route, err := service.ResolveRoute(t.Context(), ResolveRouteInput{
+		PlatformModelName: "test-model",
+		TaskType:          TaskTypeChat,
+		Scope:             RouteScopeUser,
+		ExcludedRouteIDs:  []uint{0, 1, 1},
+	})
+	if err != nil {
+		t.Fatalf("ResolveRoute() error = %v", err)
+	}
+	if route.RouteID != 2 {
+		t.Fatalf("ResolveRoute() route ID = %d, want 2", route.RouteID)
+	}
+}
+
+func TestResolveRouteIgnoresCircuitStateWhenBreakerDisabled(t *testing.T) {
+	const encryptionKey = "test-data-encryption-key-32-bytes"
+	apiKeysEnc, err := encryptAPIKeys(encryptionKey, `{"strategy":"failover","keys":[{"key":"sk-test","status":"active"}]}`)
+	if err != nil {
+		t.Fatalf("encryptAPIKeys() error = %v", err)
+	}
+
+	repo := &routeResolutionRepositoryStub{
+		model: domainchannel.PlatformModel{ID: 10, PlatformModelName: "test-model", AccessScope: ModelAccessScopePublic},
+		routes: []repository.ChannelUpstreamRouteRow{{
+			RouteID: 1, UpstreamModelID: 101, UpstreamID: 201, PlatformModelID: 10,
+			PlatformModelName: "test-model", ModelKindsJSON: `["chat"]`, Protocol: llm.AdapterOpenAIChatCompletions,
+			BaseURL: "https://example.com/v1", APIKeysEnc: apiKeysEnc, BindingCode: "binding", UpstreamModelName: "model", Weight: 1, RoutePriority: 1,
+		}},
+		breakerDefaults: domainchannel.BreakerDefaults{Enabled: false},
+	}
+	cache := memory.NewChannelCache(memory.New())
+	if err := cache.OpenUpstreamCircuit(t.Context(), 201); err != nil {
+		t.Fatalf("OpenUpstreamCircuit() error = %v", err)
+	}
+	service := NewService(config.Config{DataEncryptionKey: encryptionKey}, repo, nil, cache, nil)
+
+	route, err := service.ResolveRoute(t.Context(), ResolveRouteInput{PlatformModelName: "test-model", TaskType: TaskTypeChat})
+	if err != nil {
+		t.Fatalf("ResolveRoute() error = %v", err)
+	}
+	if route.RouteID != 1 {
+		t.Fatalf("ResolveRoute() route ID = %d, want 1", route.RouteID)
+	}
+}
+
+func TestResolveRouteHonorsCircuitStateWhenBreakerEnabled(t *testing.T) {
+	const encryptionKey = "test-data-encryption-key-32-bytes"
+	apiKeysEnc, err := encryptAPIKeys(encryptionKey, `{"strategy":"failover","keys":[{"key":"sk-test","status":"active"}]}`)
+	if err != nil {
+		t.Fatalf("encryptAPIKeys() error = %v", err)
+	}
+	repo := &routeResolutionRepositoryStub{
+		model: domainchannel.PlatformModel{ID: 10, PlatformModelName: "test-model", AccessScope: ModelAccessScopePublic},
+		routes: []repository.ChannelUpstreamRouteRow{{
+			RouteID: 1, UpstreamModelID: 101, UpstreamID: 201, PlatformModelID: 10,
+			PlatformModelName: "test-model", ModelKindsJSON: `["chat"]`, Protocol: llm.AdapterOpenAIChatCompletions,
+			BaseURL: "https://example.com/v1", APIKeysEnc: apiKeysEnc, BindingCode: "binding", UpstreamModelName: "model", Weight: 1, RoutePriority: 1,
+		}},
+		breakerDefaults: domainchannel.BreakerDefaults{Enabled: true},
+	}
+	cache := memory.NewChannelCache(memory.New())
+	if err := cache.OpenUpstreamCircuit(t.Context(), 201); err != nil {
+		t.Fatalf("OpenUpstreamCircuit() error = %v", err)
+	}
+	service := NewService(config.Config{DataEncryptionKey: encryptionKey}, repo, nil, cache, nil)
+
+	if _, err := service.ResolveRoute(t.Context(), ResolveRouteInput{PlatformModelName: "test-model", TaskType: TaskTypeChat}); !errors.Is(err, ErrAllRoutesUnavailable) {
+		t.Fatalf("ResolveRoute() error = %v, want ErrAllRoutesUnavailable", err)
+	}
+}
+
+func TestMergeHeaderJSONRouteOverridesHeaderCaseInsensitively(t *testing.T) {
+	merged := mergeHeaderJSON(
+		`{"X-Conversation-Id":"upstream","X-Static":"fixed"}`,
+		`{"x-conversation-id":"route"}`,
+	)
+	var headers map[string]string
+	if err := json.Unmarshal([]byte(merged), &headers); err != nil {
+		t.Fatalf("unmarshal merged headers: %v", err)
+	}
+	if len(headers) != 2 {
+		t.Fatalf("expected two merged headers, got %#v", headers)
+	}
+	if got := headers["x-conversation-id"]; got != "route" {
+		t.Fatalf("expected route header to override upstream casing, got %q", got)
+	}
+	if got := headers["X-Static"]; got != "fixed" {
+		t.Fatalf("expected unrelated upstream header to remain, got %q", got)
+	}
+}
+
+func TestShouldFailoverRoute(t *testing.T) {
+	tests := []struct {
+		name  string
+		cause error
+		want  bool
+	}{
+		{name: "nil", cause: nil, want: false},
+		{name: "canceled", cause: context.Canceled, want: false},
+		{name: "wrapped canceled", cause: errors.Join(errors.New("request failed"), context.Canceled), want: false},
+		{name: "deadline", cause: context.DeadlineExceeded, want: true},
+		{name: "EOF", cause: io.EOF, want: true},
+		{name: "unexpected EOF", cause: io.ErrUnexpectedEOF, want: true},
+		{name: "network", cause: &net.DNSError{IsTimeout: true}, want: true},
+		{name: "accepted stream failure", cause: llm.MarkRequestAccepted(io.ErrUnexpectedEOF), want: false},
+		{name: "request timeout", cause: &llm.UpstreamError{StatusCode: http.StatusRequestTimeout}, want: true},
+		{name: "rate limited", cause: &llm.UpstreamError{StatusCode: http.StatusTooManyRequests}, want: true},
+		{name: "server error", cause: &llm.UpstreamError{StatusCode: http.StatusBadGateway}, want: true},
+		{name: "bad request", cause: &llm.UpstreamError{StatusCode: http.StatusBadRequest}, want: false},
+		{name: "unauthorized", cause: &llm.UpstreamError{StatusCode: http.StatusUnauthorized}, want: false},
+		{name: "generic", cause: errors.New("validation failed"), want: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := ShouldFailoverRoute(test.cause); got != test.want {
+				t.Fatalf("ShouldFailoverRoute() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestBindingCircuitKeyUsesBindingCode(t *testing.T) {
+	if got := bindingCircuitKey("upm_42"); got != "upstream-model-upm_42" {
+		t.Fatalf("expected binding-level circuit key, got %q", got)
+	}
+	if got := bindingCircuitKey("upm:42"); got != "upstream-model-upm-42" {
+		t.Fatalf("expected colon-free binding-level circuit key, got %q", got)
+	}
+	if got := bindingCircuitKey(""); got != "" {
+		t.Fatalf("expected empty key for empty binding code, got %q", got)
+	}
+}
+
+func TestRemoveCandidateUsesUpstreamModelIDInsteadOfPlatformModelName(t *testing.T) {
+	items := []routeCandidate{
+		{row: repository.ChannelUpstreamRouteRow{UpstreamID: 1, UpstreamModelID: 10, PlatformModelName: "gpt-5.5"}},
+		{row: repository.ChannelUpstreamRouteRow{UpstreamID: 1, UpstreamModelID: 11, PlatformModelName: "gpt-5.5"}},
+		{row: repository.ChannelUpstreamRouteRow{UpstreamID: 2, UpstreamModelID: 10, PlatformModelName: "gpt-5.5"}},
+	}
+
+	got := removeCandidate(items, 1, 10)
+	if len(got) != 2 {
+		t.Fatalf("expected only one route candidate removed, got %d", len(got))
+	}
+	for _, item := range got {
+		if item.row.UpstreamID == 1 && item.row.UpstreamModelID == 10 {
+			t.Fatalf("route candidate was not removed: %#v", got)
+		}
+	}
+}
+
+func TestValidUserModelCapabilitiesJSONRequiresTopLevelObject(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{name: "empty inherits defaults", raw: "", want: true},
+		{name: "object", raw: `{"contextWindow":128000}`, want: true},
+		{name: "empty object", raw: `{}`, want: true},
+		{name: "array", raw: `[]`, want: false},
+		{name: "null", raw: `null`, want: false},
+		{name: "scalar", raw: `true`, want: false},
+		{name: "invalid", raw: `{`, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := validUserModelCapabilitiesJSON(test.raw); got != test.want {
+				t.Fatalf("validUserModelCapabilitiesJSON(%q) = %v, want %v", test.raw, got, test.want)
+			}
+		})
+	}
+}
+
+func TestBuildResolvedRouteSnapshotsModelIdentity(t *testing.T) {
+	route := buildResolvedRoute(repository.ChannelUpstreamRouteRow{
+		RouteID:           5,
+		PlatformModelID:   9,
+		PlatformModelName: "gpt-5.5",
+		UpstreamModelID:   7,
+		UpstreamID:        3,
+		UpstreamName:      "OpenAI Official",
+		BindingCode:       "upm_abc",
+		ModelVendor:       "openai",
+		ModelIcon:         "openai",
+		UpstreamModelName: "gpt-5.5-20260501",
+		Protocol:          "openai_responses",
+	}, "sk-test")
+
+	if route.RouteID != 5 || route.PlatformModelID != 9 || route.UpstreamModelID != 7 {
+		t.Fatalf("expected route identity snapshot, got %#v", route)
+	}
+	if route.UpstreamModel != "gpt-5.5-20260501" {
+		t.Fatalf("expected upstream model name, got %q", route.UpstreamModel)
+	}
+	if route.PlatformModelName != "gpt-5.5" || route.BindingCode != "upm_abc" || route.ModelVendor != "openai" || route.ModelIcon != "openai" {
+		t.Fatalf("expected platform model snapshot, got %#v", route)
+	}
+}
+
+func TestRecordCircuitFailureUsesPlatformModelDefaults(t *testing.T) {
+	cache := memory.NewChannelCache(memory.New())
+	service := &Service{
+		repo:  &modelUpdateRepo{},
+		cache: cache,
+	}
+	route := &ResolvedRoute{
+		UpstreamID:                      1,
+		BindingCode:                     "upm_abc",
+		PlatformModelCbFailureThreshold: 1,
+		PlatformModelCbDurationMin:      1,
+		PlatformModelCbWindowMin:        1,
+	}
+
+	service.recordCircuitFailure(context.Background(), route, domainchannel.BreakerDefaults{
+		ModelFailureThreshold: 3,
+		ModelDurationMin:      1,
+		ModelWindowMin:        1,
+	})
+
+	open, _ := cache.QueryModelCircuitStatus(context.Background(), 1, "upstream-model-upm_abc")
+	if !open {
+		t.Fatal("expected platform model default threshold to open circuit")
+	}
+}
+
+func TestRecordCircuitFailureRouteOverrideBeatsPlatformModelDefaults(t *testing.T) {
+	cache := memory.NewChannelCache(memory.New())
+	service := &Service{
+		repo:  &modelUpdateRepo{},
+		cache: cache,
+	}
+	route := &ResolvedRoute{
+		UpstreamID:                      1,
+		BindingCode:                     "upm_abc",
+		PlatformModelCbFailureThreshold: 1,
+		PlatformModelCbDurationMin:      1,
+		PlatformModelCbWindowMin:        1,
+		ModelCbFailureThreshold:         2,
+		ModelCbDurationMin:              1,
+		ModelCbWindowMin:                1,
+	}
+
+	service.recordCircuitFailure(context.Background(), route, domainchannel.BreakerDefaults{
+		ModelFailureThreshold: 3,
+		ModelDurationMin:      1,
+		ModelWindowMin:        1,
+	})
+
+	open, _ := cache.QueryModelCircuitStatus(context.Background(), 1, "upstream-model-upm_abc")
+	if open {
+		t.Fatal("expected route override threshold to keep circuit closed after one failure")
+	}
+}
+
+func TestRecordCircuitFailurePlatformModelPolicyEnforcedBeatsRouteOverride(t *testing.T) {
+	cache := memory.NewChannelCache(memory.New())
+	service := &Service{
+		repo:  &modelUpdateRepo{},
+		cache: cache,
+	}
+	route := &ResolvedRoute{
+		UpstreamID:                      1,
+		BindingCode:                     "upm_abc",
+		PlatformModelCbPolicyMode:       "enforced",
+		PlatformModelCbFailureThreshold: 1,
+		PlatformModelCbDurationMin:      1,
+		PlatformModelCbWindowMin:        1,
+		ModelCbFailureThreshold:         2,
+		ModelCbDurationMin:              1,
+		ModelCbWindowMin:                1,
+	}
+
+	service.recordCircuitFailure(context.Background(), route, domainchannel.BreakerDefaults{
+		ModelFailureThreshold: 3,
+		ModelDurationMin:      1,
+		ModelWindowMin:        1,
+	})
+
+	open, _ := cache.QueryModelCircuitStatus(context.Background(), 1, "upstream-model-upm_abc")
+	if !open {
+		t.Fatal("expected enforced platform model policy to open circuit after one failure")
+	}
+}
+
+func TestMarkRouteFailureDoesNotTripDisabledBreaker(t *testing.T) {
+	cache := memory.NewChannelCache(memory.New())
+	repo := &modelUpdateRepo{breakerDefaults: domainchannel.BreakerDefaults{
+		Enabled:               false,
+		ModelFailureThreshold: 1,
+		ModelDurationMin:      1,
+		ModelWindowMin:        1,
+	}}
+	service := &Service{repo: repo, cache: cache}
+	route := &ResolvedRoute{UpstreamID: 1, BindingCode: "upm_abc"}
+
+	service.MarkRouteFailure(t.Context(), route, &llm.UpstreamError{StatusCode: http.StatusBadGateway})
+
+	if open, _ := cache.QueryModelCircuitStatus(t.Context(), 1, bindingCircuitKey("upm_abc")); open {
+		t.Fatal("expected disabled breaker not to open")
+	}
+}
+
+func TestReleaseGrantedRouteProbesOnlyReleasesGrantedScopes(t *testing.T) {
+	cache := &releaseProbeCache{}
+	service := &Service{cache: cache}
+
+	service.releaseGrantedRouteProbes(context.Background(), &ResolvedRoute{
+		UpstreamID:           1,
+		UpstreamModelID:      2,
+		BindingCode:          "upm_abc",
+		UpstreamProbeGranted: false,
+		ModelProbeGranted:    true,
+	})
+
+	if len(cache.calls) != 1 {
+		t.Fatalf("expected one probe release, got %d", len(cache.calls))
+	}
+	if cache.calls[0].upstreamID != 1 || cache.calls[0].modelKey != "upstream-model-upm_abc" {
+		t.Fatalf("unexpected probe release call: %#v", cache.calls[0])
+	}
+}
+
+type releaseProbeCall struct {
+	upstreamID uint
+	modelKey   string
+}
+
+type releaseProbeCache struct {
+	repository.ChannelCacheRepository
+	calls []releaseProbeCall
+}
+
+func (c *releaseProbeCache) ReleaseRouteProbes(_ context.Context, upstreamID uint, modelKey string) error {
+	c.calls = append(c.calls, releaseProbeCall{upstreamID: upstreamID, modelKey: modelKey})
+	return nil
+}
+
+func TestRouteScopeAllowsModelAccessDefaultsToUserScope(t *testing.T) {
+	for _, scope := range []string{"", "unknown", RouteScopeUser} {
+		if routeScopeAllowsModelAccess(scope, ModelAccessScopeInternal) {
+			t.Fatalf("scope %q should not access internal model", scope)
+		}
+		if !routeScopeAllowsModelAccess(scope, ModelAccessScopePublic) {
+			t.Fatalf("scope %q should access public model", scope)
+		}
+	}
+}
+
+func TestRouteScopeAllowsInternalModelForInternalScope(t *testing.T) {
+	if !routeScopeAllowsModelAccess(RouteScopeInternal, ModelAccessScopeInternal) {
+		t.Fatalf("internal scope should access internal model")
+	}
+}
+
+func TestApplyModelSourceCircuitStatusPrefersUpstreamCircuit(t *testing.T) {
+	cache := memory.NewChannelCache(memory.New())
+	service := &Service{
+		repo:  &modelUpdateRepo{breakerDefaults: domainchannel.BreakerDefaults{Enabled: true}},
+		cache: cache,
+	}
+	ctx := context.Background()
+
+	if err := cache.OpenModelCircuit(ctx, 1, "upstream-model-upm_abc"); err != nil {
+		t.Fatalf("OpenModelCircuit() error = %v", err)
+	}
+	view := ModelUpstreamSourceView{
+		UpstreamID:  1,
+		BindingCode: "upm_abc",
+	}
+	service.applyModelSourceCircuitStatus(ctx, &view)
+	if !view.CircuitOpen {
+		t.Fatal("expected model circuit to be visible")
+	}
+	if view.CircuitScope != "source" {
+		t.Fatalf("expected source circuit scope, got %q", view.CircuitScope)
+	}
+
+	if err := cache.OpenUpstreamCircuit(ctx, 1); err != nil {
+		t.Fatalf("OpenUpstreamCircuit() error = %v", err)
+	}
+	service.applyModelSourceCircuitStatus(ctx, &view)
+	if !view.CircuitOpen {
+		t.Fatal("expected upstream circuit to be visible")
+	}
+	if view.CircuitScope != "upstream" {
+		t.Fatalf("expected upstream circuit scope, got %q", view.CircuitScope)
+	}
+}

@@ -1,0 +1,260 @@
+# /opt/deeix-mcp —— DEEIX 配套 MCP 服务编排
+# 服务（全部仅绑定 127.0.0.1，供 DEEIX 后端回环访问）：
+#   sandbox-mcp  :8081  多用户沙箱（自建 Go 组件，tools/sandbox-mcp）
+#   mm-core      :8082  Qwen-MM-Plugins core 能力（stdio 经 supergateway 桥接为 Streamable HTTP）
+#   mm-omni-av   :8083  Qwen-MM-Plugins api 能力（上游 omni-av 入口已废弃，迁移至官方 api 入口）
+# 用法：cp .env.example .env && 编辑凭据 -> docker compose up -d
+# ── 镜像版本策略例外说明（勿把 :latest 改成精确 tag）─────────────────────
+# 本文件的 sandbox-mcp / SANDBOX_BASE_IMAGE / mm-gateway 镜像默认 :latest，是主应用
+# 「生产必须 pin 精确 tag（/opt/deeix-chat/docker-compose.override.yml，见
+# docs/CUSTOM_DEPLOYMENT.md）」规则的已知例外：网关镜像仅在本地构建后
+# docker save/load 到 VPS，:latest 指向本地构建产物，改默认值会让 compose 判定
+# 镜像变更而误重建生产网关容器，故保持 :latest 不动。
+# 发布门禁（docs/CUSTOM_TEST_PLAN.md）只覆盖 sandbox-mcp / sandbox-base 链路；
+# mm 网关（mm-core、mm-omni-av 及 isolation wrapper）不在门禁内，
+# 升级 mm 镜像必须单独验收（真实多模态 canary + 人工核验）后再重启 compose。
+services:
+  storage-init:
+    image: alpine:3.21
+    container_name: deeix-mcp-storage-init
+    user: "0:0"
+    restart: "no"
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        install -d -m 0755 /shared /imports /mm-staging /mm-staging/core /mm-staging/api
+        find /shared /imports /mm-staging -xdev -exec chown -h 65532:65532 {} +
+        find /shared /imports /mm-staging -xdev -type d -exec chmod u+rwx,go+rx {} +
+    volumes:
+      - "${SANDBOX_SHARED_HOST_DIR:-/opt/deeix-mcp/shared}:/shared"
+      - "${SANDBOX_IMPORTS_HOST_DIR:-/opt/deeix-mcp/imports}:/imports"
+      - "${MM_STAGING_HOST_DIR:-/opt/deeix-mcp/mm-staging}:/mm-staging"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+
+  # 镜像由本地构建后 docker save/scp/load 到 VPS（tools/sandbox-mcp/deploy/sandbox-mcp.Dockerfile）；
+  # 如需在 VPS 直接构建，取消下方 build 段注释并把 image 行移到 build 下方。
+  sandbox-mcp:
+    image: "${SANDBOX_MCP_IMAGE:-deeix-sandbox-mcp:latest}"
+    # build:
+    #   context: ..
+    #   dockerfile: deploy/sandbox-mcp.Dockerfile
+    container_name: deeix-sandbox-mcp
+    restart: unless-stopped
+    user: "65532:65532"
+    depends_on:
+      storage-init:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:8081:8081"
+    networks:
+      - onepanel
+    environment:
+      SANDBOX_MCP_ADDR: "0.0.0.0:8081"
+      SANDBOX_MCP_API_KEY: "${SANDBOX_MCP_API_KEY:?set in .env}"
+      SANDBOX_BASE_IMAGE: "${SANDBOX_BASE_IMAGE:-deeix-sandbox-base:latest}"
+      SANDBOX_LEASE_TTL_SEC: "${SANDBOX_LEASE_TTL_SEC:-900}"
+      SANDBOX_EXPORT_TTL_SEC: "${SANDBOX_EXPORT_TTL_SEC:-604800}"
+      SANDBOX_EXPORT_SWEEP_INTERVAL_SEC: "${SANDBOX_EXPORT_SWEEP_INTERVAL_SEC:-3600}"
+      SANDBOX_EXEC_TIMEOUT_SEC: "${SANDBOX_EXEC_TIMEOUT_SEC:-120}"
+      SANDBOX_MAX_EXEC_TIMEOUT_SEC: "${SANDBOX_MAX_EXEC_TIMEOUT_SEC:-600}"
+      SANDBOX_TASK_TTL_SEC: "${SANDBOX_TASK_TTL_SEC:-86400}"
+      SANDBOX_MEMORY_LIMIT: "${SANDBOX_MEMORY_LIMIT:-1g}"
+      SANDBOX_PIDS_LIMIT: "${SANDBOX_PIDS_LIMIT:-256}"
+      SANDBOX_CPUS_LIMIT: "${SANDBOX_CPUS_LIMIT:-0.5}"
+      SANDBOX_CACHE_VOLUME: "${SANDBOX_CACHE_VOLUME:-deeix-sandbox-cache}"
+      SANDBOX_IMPORTS_HOST_DIR: "${SANDBOX_IMPORTS_HOST_DIR:-/opt/deeix-mcp/imports}"
+      SANDBOX_IMPORTS_DIR: "${SANDBOX_IMPORTS_DIR:-/imports}"
+      SANDBOX_SHARED_HOST_DIR: "${SANDBOX_SHARED_HOST_DIR:-/opt/deeix-mcp/shared}"
+      SANDBOX_SHARED_DIR: "${SANDBOX_SHARED_DIR:-/shared}"
+      SANDBOX_META_HMAC_KEY: "${SANDBOX_META_HMAC_KEY:-}"
+      SANDBOX_ALLOWED_HOSTS: "${SANDBOX_ALLOWED_HOSTS:-}"
+      SANDBOX_ALLOWED_CIDRS: "${SANDBOX_ALLOWED_CIDRS:-}"
+      SANDBOX_NETWORK_MODE: "${SANDBOX_NETWORK_MODE:-deeix-sandbox-egress}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # 与容器内同路径挂载共享/导入宿主目录：sandbox-mcp 进程在其中创建各 scope 子目录
+      # （会话容器仅 bind 挂载自己 scope 的子目录，租户间物理不可见）。
+      - "${SANDBOX_SHARED_HOST_DIR:-/opt/deeix-mcp/shared}:${SANDBOX_SHARED_HOST_DIR:-/opt/deeix-mcp/shared}"
+      - "${SANDBOX_IMPORTS_HOST_DIR:-/opt/deeix-mcp/imports}:${SANDBOX_IMPORTS_HOST_DIR:-/opt/deeix-mcp/imports}"
+    # 沙箱 MCP 需要按 (user, conversation) 创建/销毁容器，故授予 docker.sock；
+    # 镜像体积小、无宿主目录挂载，容器 root 能力由 AppArmor/SELinux 默认策略与资源限额兜底。
+    group_add:
+      - "${DOCKER_SOCKET_GID:?set to the host docker.sock group ID}"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8081/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  # ---- MM isolation wrappers + Qwen-MM-Plugins upstreams ----
+  # The wrappers verify backend-signed _meta and reject replayed call IDs. Each
+  # wrapper serializes tools/call, exposes only that call's staged inputs to its
+  # upstream, and clears staging immediately after the upstream response.
+  mm-core:
+    build:
+      context: .
+      dockerfile: mm-gateway.Dockerfile
+      args:
+        MM_PACKAGE: "qwen-mm-plugins[core] @ git+https://gh-proxy.com/https://github.com/QwenLM/Qwen-MM-Plugins.git@114aaaefc3f23d132c6ecc9df50fae72703f14fa"
+        MM_ENTRY: "qwen-mm-plugins-core"
+    image: deeix-mm-gateway-core:latest
+    container_name: deeix-mm-core
+    restart: unless-stopped
+    expose:
+      - "8082"
+    networks:
+      - mm-private
+    volumes:
+      - "${MM_STAGING_HOST_DIR:-/opt/deeix-mcp/mm-staging}/core:/shared:rw"
+    environment:
+      SUPER_GATEWAY_PORT: "8082"
+      DASHSCOPE_API_KEY: "${DASHSCOPE_API_KEY:?set in .env}"
+      DASHSCOPE_BASE_URL: "${DASHSCOPE_BASE_URL:-}"
+      QWEN_MM_MAX_RESPONSE_BYTES: "${QWEN_MM_MAX_RESPONSE_BYTES:-6291456}"
+      QWEN_MM_CHAT_TIMEOUT: "${QWEN_MM_CHAT_TIMEOUT:-600}"
+      SERPER_API_KEY: "${SERPER_API_KEY:-}"
+    healthcheck:
+      test: ["CMD", "node", "-e", "const n=require('net').connect(8082,'127.0.0.1',()=>{n.destroy();process.exit(0)});n.on('error',()=>process.exit(1));setTimeout(()=>process.exit(1),3000)"]
+      interval: 10s
+      timeout: 4s
+      retries: 30
+      start_period: 30s
+
+  mm-omni-av:
+    build:
+      context: .
+      dockerfile: mm-gateway.Dockerfile
+      args:
+        MM_PACKAGE: "qwen-mm-plugins[api] @ git+https://gh-proxy.com/https://github.com/QwenLM/Qwen-MM-Plugins.git@114aaaefc3f23d132c6ecc9df50fae72703f14fa"
+        MM_ENTRY: "qwen-mm-plugins-api"
+    image: deeix-mm-gateway-omni-av:latest
+    container_name: deeix-mm-omni-av
+    restart: unless-stopped
+    expose:
+      - "8083"
+    networks:
+      - mm-private
+    volumes:
+      - "${MM_STAGING_HOST_DIR:-/opt/deeix-mcp/mm-staging}/api:/shared:ro"
+    environment:
+      SUPER_GATEWAY_PORT: "8083"
+      DASHSCOPE_API_KEY: "${DASHSCOPE_API_KEY:?set in .env}"
+      DASHSCOPE_BASE_URL: "${DASHSCOPE_BASE_URL:-}"
+      QWEN_MM_MAX_RESPONSE_BYTES: "${QWEN_MM_MAX_RESPONSE_BYTES:-6291456}"
+      QWEN_MM_CHAT_TIMEOUT: "${QWEN_MM_CHAT_TIMEOUT:-600}"
+    healthcheck:
+      test: ["CMD", "node", "-e", "const n=require('net').connect(8083,'127.0.0.1',()=>{n.destroy();process.exit(0)});n.on('error',()=>process.exit(1));setTimeout(()=>process.exit(1),3000)"]
+      interval: 10s
+      timeout: 4s
+      retries: 30
+      start_period: 30s
+
+  mm-core-isolation:
+    build:
+      context: ../../../
+      dockerfile: tools/mm-isolation/Dockerfile
+    image: deeix-mm-isolation:latest
+    container_name: deeix-mm-core-isolation
+    restart: unless-stopped
+    user: "65532:65532"
+    depends_on:
+      storage-init:
+        condition: service_completed_successfully
+      mm-core:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8082:8082"
+    networks:
+      - onepanel
+      - mm-private
+    volumes:
+      - "${SANDBOX_SHARED_HOST_DIR:-/opt/deeix-mcp/shared}:/input:ro"
+      - "${SANDBOX_SHARED_HOST_DIR:-/opt/deeix-mcp/shared}:/output:rw"
+      - "${MM_IMPORTS_HOST_DIR:-/opt/deeix-mcp/imports}:/imports:ro"
+      - "${MM_STAGING_HOST_DIR:-/opt/deeix-mcp/mm-staging}/core:/staging"
+    environment:
+      MM_ISOLATION_ADDR: "0.0.0.0:8082"
+      MM_UPSTREAM: "http://mm-core:8082"
+      MM_META_HMAC_KEY: "${SANDBOX_META_HMAC_KEY:?set in .env}"
+      MM_SOURCE_SHARED: "/input"
+      MM_SOURCE_IMPORTS: "/imports"
+      MM_STAGING_ROOT: "/staging"
+      MM_OUTPUT_SHARED: "/output"
+      MM_OUTPUT_TTL_SEC: "${MM_OUTPUT_TTL_SEC:-86400}"
+      MM_OUTPUT_SWEEP_INTERVAL_SEC: "${MM_OUTPUT_SWEEP_INTERVAL_SEC:-3600}"
+      MM_UPSTREAM_TIMEOUT_SEC: "${MM_UPSTREAM_TIMEOUT_SEC:-600}"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8082/readyz"]
+      interval: 10s
+      timeout: 4s
+      retries: 30
+      start_period: 10s
+
+  mm-omni-av-isolation:
+    build:
+      context: ../../../
+      dockerfile: tools/mm-isolation/Dockerfile
+    image: deeix-mm-isolation:latest
+    container_name: deeix-mm-omni-av-isolation
+    restart: unless-stopped
+    user: "65532:65532"
+    depends_on:
+      storage-init:
+        condition: service_completed_successfully
+      mm-omni-av:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8083:8083"
+    networks:
+      - onepanel
+      - mm-private
+    volumes:
+      - "${SANDBOX_SHARED_HOST_DIR:-/opt/deeix-mcp/shared}:/input:ro"
+      - "${MM_IMPORTS_HOST_DIR:-/opt/deeix-mcp/imports}:/imports:ro"
+      - "${MM_STAGING_HOST_DIR:-/opt/deeix-mcp/mm-staging}/api:/staging"
+    environment:
+      MM_ISOLATION_ADDR: "0.0.0.0:8083"
+      MM_UPSTREAM: "http://mm-omni-av:8083"
+      MM_META_HMAC_KEY: "${SANDBOX_META_HMAC_KEY:?set in .env}"
+      MM_SOURCE_SHARED: "/input"
+      MM_SOURCE_IMPORTS: "/imports"
+      MM_STAGING_ROOT: "/staging"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8083/readyz"]
+      interval: 10s
+      timeout: 4s
+      retries: 30
+      start_period: 10s
+
+# 完整 shared/imports 根目录不挂载给 MM upstream。wrapper 只读 /input 与 /imports，
+# core producer 仅可写当前调用 staging；wrapper 校验后原子发布到当前 scope 的 /output。
+# tools/call 串行执行，每次只把当前签名调用所需文件放入 staging，响应后立即清理。
+# 旧注册 URL（8082/8083）保持端口和 MCP server identity 不变，只需重启 compose。
+
+networks:
+  onepanel:
+    external: true
+    name: 1panel-network
+  mm-private:
+    driver: bridge
