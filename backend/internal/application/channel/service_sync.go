@@ -38,10 +38,18 @@ func (s *Service) ListRemoteModels(ctx context.Context, upstreamID uint) (*Upstr
 	}
 	items = normalizeRemoteModelItems(items)
 
-	remoteNames := make([]string, 0, len(items))
+	// Pass both suffixed and raw names so we find records written before the
+	// suffix feature was introduced (migration compatibility).
+	remoteNames := make([]string, 0, len(items)*2)
 	for _, item := range items {
-		if name := strings.TrimSpace(item.ID); name != "" {
-			remoteNames = append(remoteNames, name)
+		raw := strings.TrimSpace(item.ID)
+		if raw == "" {
+			continue
+		}
+		suffixed := suffixedModelName(raw, upstreamItem.Name)
+		remoteNames = append(remoteNames, suffixed)
+		if raw != suffixed {
+			remoteNames = append(remoteNames, raw)
 		}
 	}
 	rows, err := s.repo.ListUpstreamModelsByNames(ctx, upstreamID, remoteNames)
@@ -52,28 +60,32 @@ func (s *Service) ListRemoteModels(ctx context.Context, upstreamID uint) (*Upstr
 	if err != nil {
 		return nil, err
 	}
+	// Key by the canonical suffixed name so lookups work for both old (unsuffixed)
+	// and new (suffixed) records.
 	existingByName := make(map[string]repositoryUpstreamModelSnapshot, len(rows))
 	for _, row := range rows {
-		name := strings.TrimSpace(row.UpstreamModelName)
-		if name == "" {
+		stored := strings.TrimSpace(row.UpstreamModelName)
+		if stored == "" {
 			continue
 		}
-		snapshot := existingByName[name]
+		key := suffixedModelName(rawModelName(stored, upstreamItem.Name), upstreamItem.Name)
+		snapshot := existingByName[key]
 		snapshot.BindingCode = row.BindingCode
 		snapshot.Status = row.Status
 		if platformName := strings.TrimSpace(row.PlatformModelName); platformName != "" {
 			snapshot.BoundPlatformModels = appendUniqueString(snapshot.BoundPlatformModels, platformName)
 		}
-		existingByName[name] = snapshot
+		existingByName[key] = snapshot
 	}
 
 	views := make([]UpstreamRemoteModelView, 0, len(items))
 	for _, item := range items {
-		name := strings.TrimSpace(item.ID)
-		if name == "" {
+		raw := strings.TrimSpace(item.ID)
+		if raw == "" {
 			continue
 		}
-		kindsJSON := inferKindsJSON(name)
+		name := suffixedModelName(raw, upstreamItem.Name)
+		kindsJSON := inferKindsJSON(raw)
 		suggestedProtocols, _ := resolveRouteProtocols(nil, upstreamItem.Compatible, upstreamItem.ProtocolDefaultsJSON, kindsJSON)
 		suggestedProtocol := ""
 		if len(suggestedProtocols) > 0 {
@@ -110,6 +122,33 @@ type repositoryUpstreamModelSnapshot struct {
 	BindingCode         string
 	Status              string
 	BoundPlatformModels []string
+}
+
+// suffixedModelName appends the upstream display name to the model ID so that
+// models from different upstreams with identical IDs can be distinguished.
+// Returns modelID unchanged when upstreamName is empty.
+func suffixedModelName(modelID, upstreamName string) string {
+	upstreamName = strings.TrimSpace(upstreamName)
+	if upstreamName == "" {
+		return modelID
+	}
+	return modelID + " (" + upstreamName + ")"
+}
+
+// rawModelName is the inverse of suffixedModelName: it strips the trailing
+// " (upstreamName)" suffix if present, returning the original remote model ID.
+// Used to normalise stored names that may have been written before the suffix
+// feature was introduced.
+func rawModelName(stored, upstreamName string) string {
+	upstreamName = strings.TrimSpace(upstreamName)
+	if upstreamName == "" {
+		return stored
+	}
+	suffix := " (" + upstreamName + ")"
+	if strings.HasSuffix(stored, suffix) {
+		return stored[:len(stored)-len(suffix)]
+	}
+	return stored
 }
 
 func appendUniqueString(items []string, value string) []string {
@@ -164,9 +203,19 @@ func (s *Service) reconcileRemoteModelSnapshot(
 		TotalUpstream: len(items),
 		SyncedModels:  make([]UpstreamSyncModelView, 0, len(items)),
 	}
-	remoteNames := make([]string, 0, len(items))
+	// Build the name list with both suffixed and raw forms so we pick up records
+	// written before the suffix feature was introduced.
+	remoteNames := make([]string, 0, len(items)*2)
 	for _, item := range items {
-		remoteNames = append(remoteNames, item.ID)
+		raw := strings.TrimSpace(item.ID)
+		if raw == "" {
+			continue
+		}
+		suffixed := suffixedModelName(raw, upstreamItem.Name)
+		remoteNames = append(remoteNames, suffixed)
+		if raw != suffixed {
+			remoteNames = append(remoteNames, raw)
+		}
 	}
 
 	err := s.repo.WithinTransaction(ctx, func(txRepo repository.ChannelRepository) error {
@@ -179,22 +228,25 @@ func (s *Service) reconcileRemoteModelSnapshot(
 			return syncErr
 		}
 
+		// Key by canonical suffixed name so old (unsuffixed) rows are found too.
 		existingByName := make(map[string]repositoryUpstreamModelSnapshot, len(existingRows))
 		for _, row := range existingRows {
-			name := strings.TrimSpace(row.UpstreamModelName)
-			if name == "" {
+			stored := strings.TrimSpace(row.UpstreamModelName)
+			if stored == "" {
 				continue
 			}
-			existingByName[name] = repositoryUpstreamModelSnapshot{
+			key := suffixedModelName(rawModelName(stored, upstreamItem.Name), upstreamItem.Name)
+			existingByName[key] = repositoryUpstreamModelSnapshot{
 				BindingCode: row.BindingCode,
 				Status:      row.Status,
 			}
 		}
 		managedByName := make(map[string]domainchannel.UpstreamModel, len(managedModels))
 		for _, model := range managedModels {
-			name := strings.TrimSpace(model.UpstreamModelName)
-			if name != "" {
-				managedByName[name] = model
+			stored := strings.TrimSpace(model.UpstreamModelName)
+			if stored != "" {
+				key := suffixedModelName(rawModelName(stored, upstreamItem.Name), upstreamItem.Name)
+				managedByName[key] = model
 			}
 		}
 
@@ -205,9 +257,10 @@ func (s *Service) reconcileRemoteModelSnapshot(
 		}
 		now := time.Now()
 		for _, item := range items {
-			name := item.ID
+			rawName := strings.TrimSpace(item.ID)
+			name := suffixedModelName(rawName, upstreamItem.Name)
 			remoteNameSet[name] = struct{}{}
-			kindsJSON := inferKindsJSON(name)
+			kindsJSON := inferKindsJSON(rawName)
 			protocol, resolveErr := resolveRouteProtocol("", upstreamItem.Compatible, upstreamItem.ProtocolDefaultsJSON, kindsJSON)
 			if resolveErr != nil {
 				return resolveErr
@@ -271,7 +324,9 @@ func (s *Service) reconcileRemoteModelSnapshot(
 			if !strings.EqualFold(strings.TrimSpace(model.Status), "active") {
 				continue
 			}
-			if _, present := remoteNameSet[strings.TrimSpace(model.UpstreamModelName)]; !present {
+			stored := strings.TrimSpace(model.UpstreamModelName)
+			canonical := suffixedModelName(rawModelName(stored, upstreamItem.Name), upstreamItem.Name)
+			if _, present := remoteNameSet[canonical]; !present {
 				changes.InactivateIDs = append(changes.InactivateIDs, model.ID)
 			}
 		}
@@ -341,14 +396,16 @@ func buildUpstreamModelSyncPlan(
 	}
 	managedByName := make(map[string]domainchannel.UpstreamModel, len(managedModels))
 	for _, item := range managedModels {
-		name := strings.TrimSpace(item.UpstreamModelName)
-		if name != "" {
-			managedByName[name] = item
+		stored := strings.TrimSpace(item.UpstreamModelName)
+		if stored != "" {
+			key := suffixedModelName(rawModelName(stored, upstream.Name), upstream.Name)
+			managedByName[key] = item
 		}
 	}
 	remoteNames := make(map[string]struct{}, len(remoteItems))
 	for _, item := range remoteItems {
-		name := strings.TrimSpace(item.ID)
+		raw := strings.TrimSpace(item.ID)
+		name := suffixedModelName(raw, upstream.Name)
 		remoteNames[name] = struct{}{}
 		existing, managed := managedByName[name]
 		if !managed {
@@ -363,7 +420,7 @@ func buildUpstreamModelSyncPlan(
 			plan.ReactivatedModels = append(plan.ReactivatedModels, name)
 			continue
 		}
-		kindsJSON := inferKindsJSON(name)
+		kindsJSON := inferKindsJSON(raw)
 		protocol, err := resolveRouteProtocol("", upstream.Compatible, upstream.ProtocolDefaultsJSON, kindsJSON)
 		if err != nil {
 			return UpstreamModelSyncPlanView{}, err
@@ -376,12 +433,13 @@ func buildUpstreamModelSyncPlan(
 		}
 	}
 	for _, item := range managedModels {
-		name := strings.TrimSpace(item.UpstreamModelName)
+		stored := strings.TrimSpace(item.UpstreamModelName)
 		if !strings.EqualFold(strings.TrimSpace(item.Status), "active") {
 			continue
 		}
-		if _, present := remoteNames[name]; !present {
-			plan.InactivatedModels = append(plan.InactivatedModels, name)
+		canonical := suffixedModelName(rawModelName(stored, upstream.Name), upstream.Name)
+		if _, present := remoteNames[canonical]; !present {
+			plan.InactivatedModels = append(plan.InactivatedModels, stored)
 		}
 	}
 	return plan, nil
@@ -574,7 +632,7 @@ func syncedUpstreamModel(
 	return &domainchannel.UpstreamModel{
 		UpstreamID:        upstream.ID,
 		BindingCode:       bindingCode,
-		UpstreamModelName: name,
+		UpstreamModelName: suffixedModelName(name, upstream.Name),
 		Vendor:            vendor,
 		Icon:              normalizeModelIcon("", vendor, name),
 		SuggestedProtocol: protocol,
