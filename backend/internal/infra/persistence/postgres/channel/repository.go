@@ -180,6 +180,7 @@ func (r *Repo) ListUpstreams(ctx context.Context, input repository.ListChannelUp
 		Select(
 			"u.*, COALESCE(stats.models_count, 0) AS models_count, COALESCE(stats.active_models_count, 0) AS active_models_count",
 		).
+		Where("u.deleted_at IS NULL").
 		Joins(upstreamListStatsJoinSQL())
 	listQuery = applyUpstreamListFilters(listQuery, input)
 	if err := listQuery.
@@ -200,7 +201,7 @@ func (r *Repo) GetUpstreamListRowByID(ctx context.Context, upstreamID uint) (*Up
 			"u.*, COALESCE(stats.models_count, 0) AS models_count, COALESCE(stats.active_models_count, 0) AS active_models_count",
 		).
 		Joins(upstreamListStatsJoinSQL()).
-		Where("u.id = ? AND u.owner_user_id IS NULL", upstreamID).
+		Where("u.id = ? AND u.owner_user_id IS NULL AND u.deleted_at IS NULL", upstreamID).
 		Where("(u.ownership_type = ? OR u.ownership_type IS NULL OR u.ownership_type = ?)", "platform", "").
 		Scan(&item)
 	if result.Error != nil {
@@ -218,7 +219,7 @@ func upstreamListStatsJoinSQL() string {
 			COUNT(DISTINCT CASE WHEN r.id IS NOT NULL THEN um.id END) AS models_count,
 			COUNT(DISTINCT CASE WHEN u.status = 'active' AND r.status = 'active' AND um.status = 'active' AND pm.status = 'active' AND (u.ownership_type = 'platform' OR ((u.ownership_type IS NULL OR u.ownership_type = '') AND u.owner_user_id IS NULL)) THEN um.id END) AS active_models_count
 		FROM llm_upstream_models um
-		LEFT JOIN llm_upstreams u ON u.id = um.upstream_id
+		LEFT JOIN llm_upstreams u ON u.id = um.upstream_id AND u.deleted_at IS NULL
 		LEFT JOIN llm_model_routes r ON r.upstream_model_id = um.id
 		LEFT JOIN llm_platform_models pm ON pm.id = r.platform_model_id
 		GROUP BY um.upstream_id
