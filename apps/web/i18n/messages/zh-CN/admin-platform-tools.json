@@ -8,6 +8,17 @@
     "title": "运行参数",
     "description": "写操作与文件重建相关的参数。"
   },
+  "exa": {
+    "title": "Exa 联网搜索（exa_search）",
+    "description": "向模型暴露 exa_search 工具，让会话可通过 Exa 检索实时网络内容。添加一个或多个 API Key，调用工具时平台自动轮换使用。",
+    "enabledLabel": "启用 exa_search 工具",
+    "enabledDescription": "开启且至少配置一个 API Key 后，模型可在对话中调用 exa_search 工具检索实时网络内容。",
+    "apiKeysLabel": "API Key",
+    "apiKeysDescription": "Exa API Key 列表。备注仅供自己参考，例如「主 Key」、「备用 Key」。",
+    "keyPlaceholder": "Exa API Key",
+    "notePlaceholder": "备注（可选）",
+    "addApiKey": "添加 API Key"
+  },
   "imageGen": {
     "title": "图片生成（image_gen）",
     "description": "向模型暴露 image_gen 工具，让使用非生图模型的会话也能基于当前讨论生成图片。选择一个或多个图片生成渠道；调用时由模型自行选择渠道（渠道备注会注入工具描述，向模型渐进披露）。",
