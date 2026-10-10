@@ -49,6 +49,7 @@ import { useChatScreenshotPreview } from "@/features/chat/hooks/use-chat-screens
 import { useChatTemporaryRuntime } from "@/features/chat/hooks/use-chat-temporary-runtime";
 import { useChatUIComponents } from "@/features/chat/hooks/use-chat-ui-components";
 import { useChatViewerProfile } from "@/features/chat/hooks/use-chat-viewer-profile";
+import { useChatExaSearch } from "@/features/chat/hooks/use-chat-exa-search";
 import { useChatVisualPrompt } from "@/features/chat/hooks/use-chat-visual-prompt";
 import { filterAvailableMCPToolIDs } from "@/features/chat/model/chat-mcp-tool-defaults";
 import type { ChatAreaMessage, } from "@/features/chat/types/messages";
@@ -416,6 +417,7 @@ export function AppChatArea() {
     applySelectedToolsChange(nextToolIDs);
   }, [applySelectedToolsChange, availableTools, t]);
   const htmlVisualPrompt = useChatVisualPrompt();
+  const exaSearch = useChatExaSearch();
 
   const {
     uploading,
@@ -771,6 +773,8 @@ export function AppChatArea() {
     onSelectedKnowledgeBasesChange,
     onDefaultToolsChange: onDefaultToolIDsChange,
     onHTMLVisualPromptChange: htmlVisualPrompt.setEnabled,
+    exaSearchEnabled: exaSearch.enabled,
+    onExaSearchChange: exaSearch.setEnabled,
     onOptionsChange: setModelOptions,
     onOptionsReset: resetModelOptions,
     onOptionsDefaultRestore: restoreBackendDefaultModelOptions,
