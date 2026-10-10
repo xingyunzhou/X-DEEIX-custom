@@ -86,6 +86,7 @@ func (s *Service) ListRemoteModels(ctx context.Context, upstreamID uint) (*Upstr
 			UpstreamModelName:          raw,
 			SuggestedPlatformModelName: platformModelName(raw, upstreamItem.Name),
 			SuggestedKindsJSON:         kindsJSON,
+			SuggestedVisionEnabled:     inferVisionEnabled(raw),
 			SuggestedProtocol:          suggestedProtocol,
 			SuggestedProtocols:         suggestedProtocols,
 			BindingCode:                snapshot.BindingCode,
@@ -124,6 +125,25 @@ func platformModelName(modelID, upstreamName string) string {
 		return modelID
 	}
 	return modelID + " ➕ " + upstreamName
+}
+
+// inferVisionEnabled 根据模型名推断是否支持 vision（图片输入）。
+func inferVisionEnabled(platformModelName string) bool {
+	code := strings.ToLower(strings.TrimSpace(platformModelName))
+	switch {
+	case strings.HasPrefix(code, "claude-3"), strings.HasPrefix(code, "claude-4"), strings.HasPrefix(code, "claude-5"):
+		return true
+	case strings.HasPrefix(code, "gpt-4o"), strings.HasPrefix(code, "gpt-4-turbo"):
+		return true
+	case strings.HasPrefix(code, "gemini-1.5"), strings.HasPrefix(code, "gemini-2"), strings.HasPrefix(code, "gemini-3"):
+		return true
+	case code == "grok-2", code == "grok-3", strings.HasPrefix(code, "grok-2-"), strings.HasPrefix(code, "grok-3-"):
+		return true
+	case strings.HasPrefix(code, "gemini-omni-"):
+		return true
+	default:
+		return false
+	}
 }
 
 func appendUniqueString(items []string, value string) []string {

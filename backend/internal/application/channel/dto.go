@@ -56,6 +56,7 @@ type UpstreamRemoteModelView struct {
 	UpstreamModelName          string
 	SuggestedPlatformModelName string
 	SuggestedKindsJSON         string
+	SuggestedVisionEnabled     bool
 	SuggestedProtocol          string
 	SuggestedProtocols         []string
 	BindingCode                string

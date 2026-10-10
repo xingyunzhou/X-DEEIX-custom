@@ -447,6 +447,12 @@ export function ModelSheet({ open, mode, target, models, vendors, displayGroups,
         kinds: Array.from(new Set([...current.kinds, "video_gen", "video_extension"])),
       }));
     }
+    if (selected?.suggestedVisionEnabled !== undefined) {
+      const nextValue = setVisionEnabledInCapabilities(form.capabilitiesJSON, selected.suggestedVisionEnabled);
+      if (nextValue !== null) {
+        setField("capabilitiesJSON", nextValue);
+      }
+    }
     setBindRows((current) => {
       const currentTargetRow = current.find((row) => row.id === rowID);
       if (!currentTargetRow) {

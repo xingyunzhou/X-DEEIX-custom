@@ -402,6 +402,7 @@ type UpstreamRemoteModelResponse struct {
 	UpstreamModelName          string   `json:"upstreamModelName"`
 	SuggestedPlatformModelName string   `json:"suggestedPlatformModelName"`
 	SuggestedKindsJSON         string   `json:"suggestedKindsJSON"`
+	SuggestedVisionEnabled     bool     `json:"suggestedVisionEnabled"`
 	SuggestedProtocol          string   `json:"suggestedProtocol"`
 	SuggestedProtocols         []string `json:"suggestedProtocols"`
 	BindingCode                string   `json:"bindingCode"`
@@ -436,6 +437,7 @@ func toUpstreamRemoteModelsResponse(d appchannel.UpstreamRemoteModelsData) Upstr
 			UpstreamModelName:          item.UpstreamModelName,
 			SuggestedPlatformModelName: item.SuggestedPlatformModelName,
 			SuggestedKindsJSON:         item.SuggestedKindsJSON,
+			SuggestedVisionEnabled:     item.SuggestedVisionEnabled,
 			SuggestedProtocol:          item.SuggestedProtocol,
 			SuggestedProtocols:         stringList(item.SuggestedProtocols),
 			BindingCode:                item.BindingCode,
