@@ -292,7 +292,7 @@ func ensurePlatformModel(ctx context.Context, repo repository.ChannelRepository,
 		Vendor:            normalizeModelVendor("", platformModelName, strings.Join(candidates, " ")),
 		KindsJSON:         kindsJSON,
 		Icon:              normalizeModelIcon("", "", platformModelName, strings.Join(candidates, " ")),
-		CapabilitiesJSON:  "{}",
+		CapabilitiesJSON:  `{"vision":true}`,
 		Status:            "active",
 		Description:       "",
 	}
