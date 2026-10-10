@@ -4678,6 +4678,7 @@ export interface UpstreamModelResponse {
   routeStatus: string;
   source: string;
   suggestedProtocol: string;
+  suggestedVisionEnabled: boolean;
   updatedAt: string;
   upstreamID: number;
   upstreamModelIcon: string;
