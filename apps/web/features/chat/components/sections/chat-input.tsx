@@ -386,6 +386,7 @@ function ChatInputComponent({
   defaultToolIDs,
   queuedMessages,
   htmlVisualPromptEnabled,
+  maxSelectedTools,
 
   maxSelectedSkills,
   toolsLoading,
