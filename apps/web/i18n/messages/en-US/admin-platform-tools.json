@@ -8,17 +8,6 @@
     "title": "Runtime parameters",
     "description": "Parameters for write operations and file re-processing."
   },
-  "exa": {
-    "title": "Exa web search (exa_search)",
-    "description": "Exposes an exa_search tool to models so conversations can retrieve live web results via Exa. Add one or more API keys; the platform rotates through them when the tool is called.",
-    "enabledLabel": "Enable exa_search tool",
-    "enabledDescription": "When enabled with at least one API key, models gain the exa_search tool and can query the live web during a conversation.",
-    "apiKeysLabel": "API keys",
-    "apiKeysDescription": "Exa API keys. The note is for your reference (e.g. \"primary key\", \"backup key\").",
-    "keyPlaceholder": "Exa API key",
-    "notePlaceholder": "Note (optional)",
-    "addApiKey": "Add API key"
-  },
   "imageGen": {
     "title": "Image generation (image_gen)",
     "description": "Exposes an image_gen tool to models so conversations that use non-image models can still generate images from the current discussion. Pick one or more image generation channels; the model chooses a channel itself when calling the tool (channel notes are injected into the tool description as progressive disclosure).",

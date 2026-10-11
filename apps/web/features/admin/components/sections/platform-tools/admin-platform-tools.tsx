@@ -49,14 +49,6 @@ type ImageGenChannel = {
   note: string;
 };
 
-const EXA_ENABLED_KEY = "exa_enabled";
-const EXA_API_KEYS_KEY = "exa_api_keys";
-
-type ExaApiKey = {
-  key: string;
-  note: string;
-};
-
 function toSettingsMap(items: { key: string; value: string }[]): Record<string, string> {
   const result: Record<string, string> = {};
   for (const item of items) {
@@ -103,44 +95,6 @@ function channelsEqual(left: ImageGenChannel[], right: ImageGenChannel[]): boole
   return left.every((item, index) => item.model === right[index].model && item.note === right[index].note);
 }
 
-function parseExaApiKeysJSON(raw: string | undefined): ExaApiKey[] {
-  const normalized = (raw ?? "").trim();
-  if (!normalized) {
-    return [];
-  }
-  try {
-    const parsed = JSON.parse(normalized) as unknown;
-    if (!Array.isArray(parsed)) {
-      return [];
-    }
-    return parsed.flatMap((item): ExaApiKey[] => {
-      if (item === null || typeof item !== "object" || Array.isArray(item)) {
-        return [];
-      }
-      const source = item as Record<string, unknown>;
-      const key = typeof source.key === "string" ? source.key.trim() : "";
-      const note = typeof source.note === "string" ? source.note.trim() : "";
-      if (!key) {
-        return [];
-      }
-      return [{ key, note }];
-    });
-  } catch {
-    return [];
-  }
-}
-
-function stringifyExaApiKeysJSON(keys: ExaApiKey[]): string {
-  return JSON.stringify(keys);
-}
-
-function exaApiKeysEqual(left: ExaApiKey[], right: ExaApiKey[]): boolean {
-  if (left.length !== right.length) {
-    return false;
-  }
-  return left.every((item, index) => item.key === right[index].key && item.note === right[index].note);
-}
-
 /**
  * AdminPlatformToolsSettingsPage 管理平台 Agent 工具开关：
  * enabled 控制只读工具注入，write_enabled 控制写工具注入，
@@ -155,8 +109,6 @@ export function AdminPlatformToolsSettingsPage() {
   const [savedChannels, setSavedChannels] = React.useState<ImageGenChannel[]>([]);
   const [imageGenModels, setImageGenModels] = React.useState<PublicModelDTO[]>([]);
   const [modelsLoading, setModelsLoading] = React.useState(true);
-  const [exaApiKeys, setExaApiKeys] = React.useState<ExaApiKey[]>([]);
-  const [savedExaApiKeys, setSavedExaApiKeys] = React.useState<ExaApiKey[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [saving, setSaving] = React.useState(false);
 
@@ -188,8 +140,6 @@ export function AdminPlatformToolsSettingsPage() {
       setSaved(next);
       setChannels(parseChannelsJSON(next[IMAGE_GEN_CHANNELS_KEY]));
       setSavedChannels(parseChannelsJSON(next[IMAGE_GEN_CHANNELS_KEY]));
-      setExaApiKeys(parseExaApiKeysJSON(next[EXA_API_KEYS_KEY]));
-      setSavedExaApiKeys(parseExaApiKeysJSON(next[EXA_API_KEYS_KEY]));
     } catch (error) {
       toast.error(t("toast.loadFailed"), { description: resolveAdminErrorMessage(error) });
     } finally {
@@ -204,7 +154,7 @@ export function AdminPlatformToolsSettingsPage() {
 
   const dirty = React.useMemo(() => {
     const result = new Set<string>();
-    for (const key of ["enabled", "write_enabled", IMAGE_GEN_ENABLED_KEY, EXA_ENABLED_KEY, ...PLATFORM_TOOLS_NUMBER_FIELDS.map((item) => item.key)]) {
+    for (const key of ["enabled", "write_enabled", IMAGE_GEN_ENABLED_KEY, ...PLATFORM_TOOLS_NUMBER_FIELDS.map((item) => item.key)]) {
       if ((values[key] ?? "") !== (saved[key] ?? "")) {
         result.add(key);
       }
@@ -212,11 +162,8 @@ export function AdminPlatformToolsSettingsPage() {
     if (!channelsEqual(channels, savedChannels)) {
       result.add(IMAGE_GEN_CHANNELS_KEY);
     }
-    if (!exaApiKeysEqual(exaApiKeys, savedExaApiKeys)) {
-      result.add(EXA_API_KEYS_KEY);
-    }
     return result;
-  }, [channels, exaApiKeys, saved, savedChannels, savedExaApiKeys, values]);
+  }, [channels, saved, savedChannels, values]);
 
   const handleSave = React.useCallback(async () => {
     const items: PatchSettingItem[] = dirty.size === 0
@@ -226,9 +173,7 @@ export function AdminPlatformToolsSettingsPage() {
         key,
         value: key === IMAGE_GEN_CHANNELS_KEY
           ? stringifyChannelsJSON(channels)
-          : key === EXA_API_KEYS_KEY
-            ? stringifyExaApiKeysJSON(exaApiKeys)
-            : (values[key] ?? ""),
+          : (values[key] ?? ""),
       }));
     if (items.length === 0) {
       return;
@@ -247,16 +192,13 @@ export function AdminPlatformToolsSettingsPage() {
       const nextChannels = parseChannelsJSON(next[IMAGE_GEN_CHANNELS_KEY]);
       setChannels(nextChannels);
       setSavedChannels(nextChannels);
-      const nextExaApiKeys = parseExaApiKeysJSON(next[EXA_API_KEYS_KEY]);
-      setExaApiKeys(nextExaApiKeys);
-      setSavedExaApiKeys(nextExaApiKeys);
       toast.success(t("toast.updated"));
     } catch (error) {
       toast.error(t("toast.saveFailed"), { description: resolveAdminErrorMessage(error) });
     } finally {
       setSaving(false);
     }
-  }, [channels, dirty, exaApiKeys, t, values]);
+  }, [channels, dirty, t, values]);
 
   function updateChannel(index: number, patch: Partial<ImageGenChannel>) {
     setChannels((prev) => prev.map((item, i) => (i === index ? { ...item, ...patch } : item)));
@@ -283,32 +225,6 @@ export function AdminPlatformToolsSettingsPage() {
     setChannels((prev) => [...prev, { model: "", note: "" }]);
   }
 
-  function updateExaApiKey(index: number, patch: Partial<ExaApiKey>) {
-    setExaApiKeys((prev) => prev.map((item, i) => (i === index ? { ...item, ...patch } : item)));
-  }
-
-  function removeExaApiKey(index: number) {
-    setExaApiKeys((prev) => prev.filter((_, i) => i !== index));
-  }
-
-  function moveExaApiKey(index: number, direction: -1 | 1) {
-    setExaApiKeys((prev) => {
-      const target = index + direction;
-      if (target < 0 || target >= prev.length) {
-        return prev;
-      }
-      const next = [...prev];
-      const [item] = next.splice(index, 1);
-      next.splice(target, 0, item);
-      return next;
-    });
-  }
-
-  function addExaApiKey() {
-    setExaApiKeys((prev) => [...prev, { key: "", note: "" }]);
-  }
-
-  const exaEnabled = values[EXA_ENABLED_KEY] === "true";
   const imageGenEnabled = values[IMAGE_GEN_ENABLED_KEY] === "true";
 
   if (loading) {
@@ -495,96 +411,6 @@ export function AdminPlatformToolsSettingsPage() {
           >
             <Plus className="size-3.5" />
             {t("imageGen.addChannel")}
-          </Button>
-        </div>
-      </SettingsSection>
-
-      <SettingsSectionSeparator />
-
-      <SettingsSection title={t("exa.title")}>
-        <p className="mb-3 text-xs leading-5 text-muted-foreground">{t("exa.description")}</p>
-        <SettingsFieldList>
-          <SettingsFieldItem>
-            <SettingsFieldRow
-              title={t("exa.enabledLabel")}
-              description={t("exa.enabledDescription")}
-            >
-              <Switch
-                checked={exaEnabled}
-                onCheckedChange={(checked) => {
-                  setValues((prev) => ({ ...prev, [EXA_ENABLED_KEY]: checked ? "true" : "false" }));
-                }}
-                disabled={saving}
-              />
-            </SettingsFieldRow>
-          </SettingsFieldItem>
-          <SettingsFieldItem index={1}>
-            <SettingsFieldRow
-              title={t("exa.apiKeysLabel")}
-              description={t("exa.apiKeysDescription")}
-            />
-          </SettingsFieldItem>
-        </SettingsFieldList>
-
-        <div className="mt-1 space-y-2">
-          {exaApiKeys.map((entry, index) => (
-            <div key={index} className="flex items-center gap-2">
-              <div className="flex flex-col">
-                <button
-                  type="button"
-                  aria-label="up"
-                  className="flex size-4 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-30"
-                  disabled={saving || index === 0}
-                  onClick={() => moveExaApiKey(index, -1)}
-                >
-                  <ArrowUp className="size-3" />
-                </button>
-                <button
-                  type="button"
-                  aria-label="down"
-                  className="flex size-4 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-30"
-                  disabled={saving || index === exaApiKeys.length - 1}
-                  onClick={() => moveExaApiKey(index, 1)}
-                >
-                  <ArrowDown className="size-3" />
-                </button>
-              </div>
-              <Input
-                value={entry.key}
-                placeholder={t("exa.keyPlaceholder")}
-                className="h-8 w-64 min-w-0 font-mono text-xs"
-                onChange={(event) => updateExaApiKey(index, { key: event.target.value })}
-                disabled={saving}
-              />
-              <Input
-                value={entry.note}
-                placeholder={t("exa.notePlaceholder")}
-                className="h-8 min-w-0 flex-1 text-xs"
-                onChange={(event) => updateExaApiKey(index, { note: event.target.value })}
-                disabled={saving}
-              />
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                className="size-8 shrink-0 text-muted-foreground hover:text-destructive"
-                disabled={saving}
-                onClick={() => removeExaApiKey(index)}
-              >
-                <Trash2 className="size-3.5" />
-              </Button>
-            </div>
-          ))}
-          <Button
-            type="button"
-            variant="secondary"
-            size="sm"
-            className="h-8 text-xs font-normal shadow-none"
-            disabled={saving}
-            onClick={addExaApiKey}
-          >
-            <Plus className="size-3.5" />
-            {t("exa.addApiKey")}
           </Button>
         </div>
       </SettingsSection>

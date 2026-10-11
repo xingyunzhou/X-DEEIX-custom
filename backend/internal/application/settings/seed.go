@@ -225,8 +225,6 @@ func legacyCustomSettings() []domainsettings.SystemSetting {
 		{Namespace: "platform_tools", Key: "file_reindex_delay_seconds", Value: "60", ValueType: "int", Description: "文件内容修改后延迟重建提取/RAG 的缓冲秒数（避免频繁修改反复重建）"},
 		{Namespace: "platform_tools", Key: "image_gen_enabled", Value: "false", ValueType: "bool", Description: "是否启用 image_gen 平台工具（模型可在对话中按配置渠道生成图片）"},
 		{Namespace: "platform_tools", Key: "image_gen_channels", Value: "[]", ValueType: "json", Description: "image_gen 可用渠道列表（JSON 数组：[{model,note}]，note 为渠道备注如\"可生成4K图\"，注入工具描述供模型选择）"},
-		{Namespace: "platform_tools", Key: "exa_enabled", Value: "false", ValueType: "bool", Description: "是否启用 exa_search 平台工具（模型可在对话中调用 Exa 检索实时网络内容）"},
-		{Namespace: "platform_tools", Key: "exa_api_keys", Value: "[]", ValueType: "json", Description: "Exa API Key 列表（JSON 数组：[{key,note}]，平台调用时轮换使用）"},
 	}
 }
 

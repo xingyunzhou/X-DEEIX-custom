@@ -42,7 +42,6 @@ import { Blocks } from "@/components/animate-ui/icons/blocks";
 import { Crop } from "@/components/animate-ui/icons/crop";
 import { Link as LinkIcon } from "@/components/animate-ui/icons/link";
 import { Pause } from "@/components/animate-ui/icons/pause";
-import { Search } from "@/components/animate-ui/icons/search";
 import { Send } from "@/components/animate-ui/icons/send";
 import { X as XIcon } from "@/components/animate-ui/icons/x";
 import {
@@ -186,7 +185,6 @@ type ChatInputProps = {
   defaultToolIDs: number[];
   queuedMessages: QueuedComposerMessage[];
   htmlVisualPromptEnabled: boolean;
-  exaSearchEnabled: boolean;
   maxSelectedTools: number;
   maxSelectedSkills: number;
   toolsLoading: boolean;
@@ -210,7 +208,6 @@ type ChatInputProps = {
   onSelectedKnowledgeBasesChange: (ids: string[]) => void;
   onDefaultToolsChange: (toolIDs: number[]) => void | Promise<void>;
   onHTMLVisualPromptChange: (enabled: boolean) => void;
-  onExaSearchChange: (enabled: boolean) => void;
   onOptionsChange: React.Dispatch<React.SetStateAction<ConversationOptions>>;
   onOptionsReset: (defaults?: ConversationOptions) => void;
   onOptionsDefaultRestore: () => Promise<ConversationOptions | null>;
@@ -389,8 +386,7 @@ function ChatInputComponent({
   defaultToolIDs,
   queuedMessages,
   htmlVisualPromptEnabled,
-  exaSearchEnabled,
-  maxSelectedTools,
+
   maxSelectedSkills,
   toolsLoading,
   toolsErrorMsg = "",
@@ -412,7 +408,6 @@ function ChatInputComponent({
   onSelectedKnowledgeBasesChange,
   onDefaultToolsChange,
   onHTMLVisualPromptChange,
-  onExaSearchChange,
   onOptionsChange,
   onOptionsReset,
   onOptionsDefaultRestore,
@@ -1394,29 +1389,6 @@ function ChatInputComponent({
                   </TooltipContent>
                 </Tooltip>
               ) : null}
-
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <InputGroupButton
-                    type="button"
-                    variant="ghost"
-                    size="icon-sm"
-                    className={cn(
-                      "size-7 rounded-md text-muted-foreground hover:text-foreground sm:size-8",
-                      exaSearchEnabled && "bg-primary/10 text-primary hover:bg-primary/10 hover:text-primary",
-                    )}
-                    disabled={loading || uploading}
-                    aria-label={tComposer("exaSearch")}
-                    aria-pressed={exaSearchEnabled}
-                    onClick={() => onExaSearchChange(!exaSearchEnabled)}
-                  >
-                    <Search size={16} strokeWidth={1.6} animate={exaSearchEnabled ? "default" : undefined} />
-                  </InputGroupButton>
-                </TooltipTrigger>
-                <TooltipContent side="top" className="text-xs">
-                  {tComposer("exaSearch")}
-                </TooltipContent>
-              </Tooltip>
 
               {hasDraftText ? (
                 <Tooltip>
