@@ -192,14 +192,12 @@ export function SidebarConversationItem({
             className="mr-1.5 size-3.5 shrink-0 text-primary"
             role="status"
             aria-label={t("processing")}
-            title={t("processing")}
           />
         ) : isCompleted ? (
           <CheckCircle2
             className="mr-1.5 size-3.5 shrink-0 text-emerald-600 dark:text-emerald-400"
             role="status"
             aria-label={t("completed")}
-            title={t("completed")}
           />
         ) : item.hasUnread ? (
           <span className="unread-dot mr-1.5" role="status" aria-label={t("unread")} />

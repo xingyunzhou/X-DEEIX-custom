@@ -156,14 +156,12 @@ function RecentConversationRow({
             className="size-3.5 shrink-0 text-primary"
             role="status"
             aria-label={t("row.processing")}
-            title={t("row.processing")}
           />
         ) : isCompleted ? (
           <CheckCircle2
             className="size-3.5 shrink-0 text-emerald-600 dark:text-emerald-400"
             role="status"
             aria-label={t("row.completed")}
-            title={t("row.completed")}
           />
         ) : item.hasUnread ? (
           <span className="unread-dot shrink-0" role="status" aria-label={t("row.unread")} />
