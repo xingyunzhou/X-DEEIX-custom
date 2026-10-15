@@ -81,6 +81,7 @@ export function AppChatArea() {
   const routeConversationID = temporaryMode ? null : searchParams.get("conversation_id")?.trim() || null;
   const routeProjectID = temporaryMode ? null : searchParams.get("project_id")?.trim() || null;
   const {
+    completeConversationRun,
     detachConversationRun,
     finishConversationRun,
     newConversationRevision,
@@ -168,6 +169,7 @@ export function AppChatArea() {
     activeGenerationRunsRef,
     activeGenerationRunsRevision,
     onConversationRunFinished: finishConversationRun,
+    onConversationRunCompleted: completeConversationRun,
   });
   const { greetingTitle } = useChatViewerProfile();
   const activeConversation = React.useMemo(() => {
@@ -496,6 +498,7 @@ export function AppChatArea() {
     onActiveGenerationRunsChange,
     onConversationRunDetached: detachConversationRun,
     onConversationRunFinished: finishConversationRun,
+    onConversationRunCompleted: completeConversationRun,
     onConversationRunStarted: registerConversationRun,
     resumingActivityLabel,
     resumingRunID,

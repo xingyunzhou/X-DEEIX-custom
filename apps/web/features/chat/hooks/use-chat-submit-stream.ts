@@ -62,6 +62,7 @@ export function useChatSubmitStream({
   onActiveGenerationRunsChange,
   onConversationRunDetached,
   onConversationRunFinished,
+  onConversationRunCompleted,
   onConversationRunStarted,
   resumeGenerationActive,
 }: {
@@ -108,6 +109,7 @@ export function useChatSubmitStream({
   onActiveGenerationRunsChange?: () => void;
   onConversationRunDetached?: (runID: string) => void;
   onConversationRunFinished?: (runID: string) => void;
+  onConversationRunCompleted?: (runID: string, conversationPublicID: string) => void;
   onConversationRunStarted?: (runID: string, conversationPublicID: string) => void;
   resumeGenerationActive?: boolean;
 }) {
@@ -166,6 +168,7 @@ export function useChatSubmitStream({
     onActiveGenerationRunsChange,
     onConversationRunDetached,
     onConversationRunFinished,
+    onConversationRunCompleted,
     onConversationRunStarted,
     resumeGenerationActive,
   });

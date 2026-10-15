@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { Archive, Check, PencilLine, Share2, Star, Tag, Trash } from "lucide-react";
+import { Archive, Check, CheckCircle2, PencilLine, Share2, Star, Tag, Trash } from "lucide-react";
 import { useTranslations } from "next-intl";
 
 import { Ellipsis } from "@/components/animate-ui/icons/ellipsis";
@@ -10,6 +10,7 @@ import { AnimatedText } from "@/components/ui/animated-text";
 import { LoadingReveal } from "@/shared/components/loading-reveal";
 import type { RecentRowState } from "@/features/recent/types/recent";
 import { ConversationLabelsMenuItem, isArchivedConversation } from "@/entities/conversation";
+import { useConversationStatus } from "@/features/chat";
 import {
   formatRelativeUpdatedAt,
   recentEmptyStateTitle,
@@ -26,6 +27,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Badge } from "@/components/ui/badge";
 import { CenteredEmptyState } from "@/components/ui/empty-state";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Spinner } from "@/components/ui/spinner";
 import { ConversationProjectSubmenu } from "@/shared/components/conversation-project-submenu";
 import { ConversationShareExportSubmenu } from "@/shared/components/conversation-share-export-menu";
 import { cn } from "@/lib/utils";
@@ -133,6 +135,9 @@ function RecentConversationRow({
 }) {
   const t = useTranslations("recent");
   const { locale } = useAppLocale();
+  const conversationStatus = useConversationStatus(item.publicID);
+  const isRunning = streaming || conversationStatus === "running";
+  const isCompleted = !isRunning && conversationStatus === "completed";
   const [menuOpen, setMenuOpen] = React.useState(false);
   const archived = isArchivedConversation(item);
   const shared = item.shareStatus === "active" && Boolean(item.shareID?.trim());
@@ -146,13 +151,27 @@ function RecentConversationRow({
   const rowContent = (
     <>
       <div className="flex items-center gap-2">
-        {item.hasUnread && !streaming ? (
+        {isRunning ? (
+          <Spinner
+            className="size-3.5 shrink-0 text-primary"
+            role="status"
+            aria-label={t("row.processing")}
+            title={t("row.processing")}
+          />
+        ) : isCompleted ? (
+          <CheckCircle2
+            className="size-3.5 shrink-0 text-emerald-600 dark:text-emerald-400"
+            role="status"
+            aria-label={t("row.completed")}
+            title={t("row.completed")}
+          />
+        ) : item.hasUnread ? (
           <span className="unread-dot shrink-0" role="status" aria-label={t("row.unread")} />
         ) : null}
         <AnimatedText
           text={title}
           className="min-w-0 shrink"
-          textClassName={cn("text-sm font-medium text-foreground", streaming && "trace-sweep")}
+          textClassName={cn("text-sm font-medium text-foreground", isRunning && "trace-sweep")}
         />
         {visibleLabels.length > 0 ? (
           <div className="flex max-w-[55%] shrink-0 items-center gap-1 overflow-hidden">

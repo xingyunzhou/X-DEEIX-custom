@@ -127,6 +127,8 @@
     "autoRename": "Auto rename",
     "menu": "Conversation menu",
     "unread": "Unread reply",
+    "processing": "Generating reply",
+    "completed": "Reply completed",
     "shareAndExport": "Share & Export",
     "manageShare": "Manage share",
     "share": "Share",

@@ -2,6 +2,7 @@ export {
   ChatSessionProvider,
   useChatSession,
   useConversationRunning,
+  useConversationStatus,
 } from "@/features/chat/context/chat-session-context";
 
 // 以下导出是 share（公开分享页）消费的只读消息渲染契约。

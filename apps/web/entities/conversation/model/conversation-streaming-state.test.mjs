@@ -51,8 +51,11 @@ test("streaming titles sweep only their text while unread dots remain completion
   assert.match(globalStyles, /prefers-reduced-motion:\s*reduce[\s\S]*\.trace-sweep[\s\S]*animation:\s*none/);
 
   for (const source of [sidebarConversationItem, recentList]) {
-    assert.match(source, /item\.hasUnread\s*&&\s*!streaming/);
-    assert.match(source, /streaming\s*&&\s*"trace-sweep"/);
+    assert.match(source, /isRunning\s*=\s*streaming\s*\|\|\s*conversationStatus\s*===\s*"running"/);
+    assert.match(source, /isRunning\s*&&\s*"trace-sweep"/);
+    assert.match(source, /Spinner/);
+    assert.match(source, /CheckCircle2/);
+    assert.match(source, /text-emerald-6/);
   }
 });
 

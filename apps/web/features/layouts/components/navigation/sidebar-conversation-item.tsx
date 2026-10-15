@@ -2,11 +2,12 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { Archive, PencilLine, Trash, type LucideIcon } from "lucide-react";
+import { Archive, CheckCircle2, PencilLine, Trash, type LucideIcon } from "lucide-react";
 import { motion } from "motion/react";
 import { useTranslations } from "next-intl";
 
 import { Ellipsis } from "@/components/animate-ui/icons/ellipsis";
+import { useConversationStatus } from "@/features/chat";
 import { Sparkles } from "@/components/animate-ui/icons/sparkles";
 import { AnimatedText } from "@/components/ui/animated-text";
 import { Button } from "@/components/ui/button";
@@ -105,6 +106,9 @@ export function SidebarConversationItem({
   streaming = false,
 }: SidebarConversationItemProps) {
   const t = useTranslations("recent.row");
+  const conversationStatus = useConversationStatus(item.publicID);
+  const isRunning = streaming || conversationStatus === "running";
+  const isCompleted = !isRunning && conversationStatus === "completed";
   const [isMenuOpen, setIsMenuOpen] = React.useState(false);
   const labels = React.useMemo(
     () => parseConversationLabelsJSON(item.labelsJSON ?? "[]"),
@@ -183,13 +187,27 @@ export function SidebarConversationItem({
         className={cn("flex h-full min-w-0 flex-1 items-center pl-2 pr-9", linkClassName)}
         onClick={(event) => onNavigate?.(item.url, event)}
       >
-        {item.hasUnread && !streaming ? (
+        {isRunning ? (
+          <Spinner
+            className="mr-1.5 size-3.5 shrink-0 text-primary"
+            role="status"
+            aria-label={t("processing")}
+            title={t("processing")}
+          />
+        ) : isCompleted ? (
+          <CheckCircle2
+            className="mr-1.5 size-3.5 shrink-0 text-emerald-600 dark:text-emerald-400"
+            role="status"
+            aria-label={t("completed")}
+            title={t("completed")}
+          />
+        ) : item.hasUnread ? (
           <span className="unread-dot mr-1.5" role="status" aria-label={t("unread")} />
         ) : null}
         <AnimatedText
           text={item.title}
           className="flex-1"
-          textClassName={cn("text-current", streaming && "trace-sweep")}
+          textClassName={cn("text-current", isRunning && "trace-sweep")}
         />
       </Link>
 

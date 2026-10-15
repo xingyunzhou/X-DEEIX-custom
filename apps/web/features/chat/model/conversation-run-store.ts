@@ -6,6 +6,9 @@ export type ConversationRunSnapshot = {
 // local 记录连续缺席权威快照超过该时长后视为失效并移除。
 // 需大于「本地注册到服务端登记完成」的竞态窗口，小于用户可感知的卡死时长。
 const LOCAL_RUN_SNAPSHOT_MISS_TTL_MS = 15_000;
+const COMPLETED_STATUS_TTL_MS = 4_000;
+
+export type ConversationStatus = "idle" | "running" | "completed";
 
 type ConversationRunRecord = {
   conversationPublicID: string;
@@ -18,6 +21,8 @@ type Listener = () => void;
 
 export class ConversationRunStore {
   private readonly records = new Map<string, ConversationRunRecord>();
+  private readonly completedConversationIDs = new Set<string>();
+  private readonly completedTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly listeners = new Map<string, Set<Listener>>();
 
   subscribe(conversationPublicID: string, listener: Listener): () => void {
@@ -52,6 +57,45 @@ export class ConversationRunStore {
     return false;
   }
 
+  getConversationStatus(conversationPublicID: string): ConversationStatus {
+    const conversationID = conversationPublicID.trim();
+    if (!conversationID) {
+      return "idle";
+    }
+    if (this.isConversationRunning(conversationID)) {
+      return "running";
+    }
+    return this.completedConversationIDs.has(conversationID) ? "completed" : "idle";
+  }
+
+  markConversationCompleted(conversationPublicID: string): void {
+    const conversationID = conversationPublicID.trim();
+    if (!conversationID) {
+      return;
+    }
+    this.mutate(() => {
+      this.clearCompletedConversation(conversationID);
+      this.completedConversationIDs.add(conversationID);
+    });
+    const timer = setTimeout(() => {
+      this.completedTimers.delete(conversationID);
+      if (!this.completedConversationIDs.delete(conversationID)) {
+        return;
+      }
+      this.notifyConversation(conversationID);
+    }, COMPLETED_STATUS_TTL_MS);
+    this.completedTimers.set(conversationID, timer);
+  }
+
+  complete(runID: string, conversationPublicID: string): void {
+    const conversationID = conversationPublicID.trim();
+    if (!conversationID) {
+      return;
+    }
+    this.markConversationCompleted(conversationID);
+    this.settle(runID);
+  }
+
   register(runID: string, conversationPublicID: string): void {
     const normalizedRunID = runID.trim();
     const conversationID = conversationPublicID.trim();
@@ -69,6 +113,7 @@ export class ConversationRunStore {
       if (existing?.status === "local") {
         return;
       }
+      this.clearCompletedConversation(conversationID);
       this.records.set(normalizedRunID, {
         conversationPublicID: conversationID,
         status: "local",
@@ -119,11 +164,16 @@ export class ConversationRunStore {
       ) {
         return;
       }
+      this.clearCompletedConversation(conversationID);
       this.records.set(normalizedRunID, {
         conversationPublicID: conversationID,
         status: "server",
       });
     });
+  }
+
+  applyCompleted(conversationPublicID: string): void {
+    this.markConversationCompleted(conversationPublicID);
   }
 
   applyFinished(runID: string, authoritative: boolean): void {
@@ -221,28 +271,52 @@ export class ConversationRunStore {
   }
 
   clear(): void {
-    this.mutate(() => this.records.clear());
+    for (const timer of this.completedTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.completedTimers.clear();
+    this.mutate(() => {
+      this.records.clear();
+      this.completedConversationIDs.clear();
+    });
   }
 
-  private activeConversationIDs(): Set<string> {
-    const result = new Set<string>();
-    for (const record of this.records.values()) {
-      if (record.status !== "settled") {
-        result.add(record.conversationPublicID);
-      }
+  private clearCompletedConversation(conversationPublicID: string): void {
+    const conversationID = conversationPublicID.trim();
+    if (!conversationID) {
+      return;
     }
-    return result;
+    const timer = this.completedTimers.get(conversationID);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      this.completedTimers.delete(conversationID);
+    }
+    this.completedConversationIDs.delete(conversationID);
+  }
+
+  private notifyConversation(conversationPublicID: string): void {
+    for (const listener of this.listeners.get(conversationPublicID) ?? []) {
+      listener();
+    }
+  }
+
+  private conversationStatusSnapshot(): Map<string, ConversationStatus> {
+    const conversationIDs = new Set(this.completedConversationIDs);
+    for (const record of this.records.values()) {
+      conversationIDs.add(record.conversationPublicID);
+    }
+    return new Map(
+      [...conversationIDs].map((conversationID) => [conversationID, this.getConversationStatus(conversationID)]),
+    );
   }
 
   private mutate(update: () => void): void {
-    const previous = this.activeConversationIDs();
+    const previous = this.conversationStatusSnapshot();
     update();
-    const next = this.activeConversationIDs();
-    for (const conversationID of new Set([...previous, ...next])) {
-      if (previous.has(conversationID) !== next.has(conversationID)) {
-        for (const listener of this.listeners.get(conversationID) ?? []) {
-          listener();
-        }
+    const next = this.conversationStatusSnapshot();
+    for (const conversationID of new Set([...previous.keys(), ...next.keys()])) {
+      if (previous.get(conversationID) !== next.get(conversationID)) {
+        this.notifyConversation(conversationID);
       }
     }
   }

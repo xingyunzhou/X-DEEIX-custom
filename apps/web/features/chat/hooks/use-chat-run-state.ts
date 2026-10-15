@@ -58,6 +58,23 @@ export function useChatRunState() {
     [store],
   );
 
+  const completeConversationRun = React.useCallback(
+    (runID: string, conversationPublicID: string) => {
+      const normalizedRunID = runID.trim();
+      const normalizedConversationID = conversationPublicID.trim();
+      if (!normalizedRunID || !normalizedConversationID) {
+        return;
+      }
+      runStateChannelRef.current?.postMessage({
+        type: "completed",
+        runID: normalizedRunID,
+        conversationPublicID: normalizedConversationID,
+      });
+      store.complete(normalizedRunID, normalizedConversationID);
+    },
+    [store],
+  );
+
   React.useEffect(() => {
     if (storeUserPublicIDRef.current === userPublicID) {
       return;
@@ -93,6 +110,10 @@ export function useChatRunState() {
         typeof message.conversationPublicID === "string"
           ? message.conversationPublicID.trim()
           : "";
+      if (message.type === "completed" && conversationPublicID) {
+        store.applyCompleted(conversationPublicID);
+        return;
+      }
       if (message.type === "started" && conversationPublicID) {
         store.applyStarted(runID, conversationPublicID);
       }
@@ -214,6 +235,7 @@ export function useChatRunState() {
   }, [accessToken, store]);
 
   return {
+    completeConversationRun,
     detachConversationRun,
     finishConversationRun,
     registerConversationRun,

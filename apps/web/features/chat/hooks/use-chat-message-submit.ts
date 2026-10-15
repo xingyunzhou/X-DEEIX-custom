@@ -121,6 +121,7 @@ export function useChatMessageSubmit({
   onActiveGenerationRunsChange,
   onConversationRunDetached,
   onConversationRunFinished,
+  onConversationRunCompleted,
   onConversationRunStarted,
   resumeGenerationActive = false,
 }: {
@@ -174,6 +175,7 @@ export function useChatMessageSubmit({
   onActiveGenerationRunsChange?: () => void;
   onConversationRunDetached?: (runID: string) => void;
   onConversationRunFinished?: (runID: string) => void;
+  onConversationRunCompleted?: (runID: string, conversationPublicID: string) => void;
   onConversationRunStarted?: (runID: string, conversationPublicID: string) => void;
   resumeGenerationActive?: boolean;
 }) {
@@ -557,6 +559,9 @@ export function useChatMessageSubmit({
 
         terminalResultReceived = true;
         const assistantMessageSucceeded = (completed.assistantMessage.status || "success") === "success";
+        if (assistantMessageSucceeded && targetConversationID) {
+          onConversationRunCompleted?.(clientRunID, targetConversationID);
+        }
         const completedBranchScope: BranchScope = {
           conversationScopeKey: targetConversationScopeKey,
           branchScopePath: assistantOnlyBranch
@@ -777,6 +782,7 @@ export function useChatMessageSubmit({
       onConversationCreated,
       onConversationRunDetached,
       onConversationRunFinished,
+      onConversationRunCompleted,
       onConversationRunStarted,
       options,
       prependNewConversation,

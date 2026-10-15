@@ -47,12 +47,14 @@ export function useChatData(
     isGroupConversation,
     activeGenerationRunsRevision = 0,
     onConversationRunFinished,
+    onConversationRunCompleted,
   }: {
     activeGenerationRunsRef?: React.RefObject<Set<string>>;
     activeGenerationRunsRevision?: number;
     // 群组会话：刷新恢复时重建群组运行占位（§16.8 正在恢复运行）。
     isGroupConversation?: boolean;
     onConversationRunFinished?: (runID: string) => void;
+    onConversationRunCompleted?: (runID: string, conversationPublicID: string) => void;
   } = {},
 ) {
   const t = useTranslations("chat.data");
@@ -560,6 +562,9 @@ export function useChatData(
           },
         });
         if (!controller.signal.aborted) {
+          if (completed?.assistantMessage?.status === "success" && conversationID) {
+            onConversationRunCompleted?.(pendingRunID, conversationID);
+          }
           if (!completed) {
             synthesizeGroupRunPausedState(pendingRunID);
           }
@@ -623,6 +628,7 @@ export function useChatData(
     conversationID,
     pendingRunID,
     pendingRunIsActive,
+    onConversationRunCompleted,
     onConversationRunFinished,
     reload,
   ]);

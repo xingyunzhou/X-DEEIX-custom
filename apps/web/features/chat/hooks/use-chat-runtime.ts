@@ -118,6 +118,7 @@ export function useChatRuntime({
   onActiveGenerationRunsChange,
   onConversationRunDetached,
   onConversationRunFinished,
+  onConversationRunCompleted,
   onConversationRunStarted,
   resumingRunID = "",
   resumingActivityLabel = "",
@@ -155,6 +156,7 @@ export function useChatRuntime({
   onActiveGenerationRunsChange?: () => void;
   onConversationRunDetached?: (runID: string) => void;
   onConversationRunFinished?: (runID: string) => void;
+  onConversationRunCompleted?: (runID: string, conversationPublicID: string) => void;
   onConversationRunStarted?: (runID: string, conversationPublicID: string) => void;
   resumingRunID?: string;
   resumingActivityLabel?: string;
@@ -245,6 +247,7 @@ export function useChatRuntime({
     onActiveGenerationRunsChange,
     onConversationRunDetached,
     onConversationRunFinished,
+    onConversationRunCompleted,
     onConversationRunStarted,
     resumeGenerationActive: visibleResumeGenerationActive,
   });

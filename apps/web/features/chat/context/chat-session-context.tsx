@@ -10,6 +10,7 @@ type ChatSessionContextValue = {
   newConversationProjectID: string;
   newConversationRoleID: string;
   newConversationAgentGroupID: string;
+  completeConversationRun: (runID: string, conversationPublicID: string) => void;
   detachConversationRun: (runID: string) => void;
   finishConversationRun: (runID: string) => void;
   registerConversationRun: (runID: string, conversationPublicID: string) => void;
@@ -22,6 +23,7 @@ const ConversationRunStoreContext = React.createContext<ConversationRunStore | n
 export function ChatSessionProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = React.useState({ revision: 0, projectID: "", roleID: "", agentGroupID: "" });
   const {
+    completeConversationRun,
     detachConversationRun,
     finishConversationRun,
     registerConversationRun,
@@ -41,12 +43,14 @@ export function ChatSessionProvider({ children }: { children: React.ReactNode })
       newConversationProjectID: state.projectID,
       newConversationRoleID: state.roleID,
       newConversationAgentGroupID: state.agentGroupID,
+      completeConversationRun,
       detachConversationRun,
       finishConversationRun,
       registerConversationRun,
       requestNewConversation,
     }),
     [
+      completeConversationRun,
       detachConversationRun,
       finishConversationRun,
       registerConversationRun,
@@ -88,4 +92,21 @@ export function useConversationRunning(conversationPublicID: string): boolean {
     [conversationID, store],
   );
   return React.useSyncExternalStore(subscribe, getSnapshot, () => false);
+}
+
+export function useConversationStatus(conversationPublicID: string) {
+  const store = React.useContext(ConversationRunStoreContext);
+  if (!store) {
+    throw new Error("useConversationStatus must be used within ChatSessionProvider");
+  }
+  const conversationID = conversationPublicID.trim();
+  const subscribe = React.useCallback(
+    (listener: () => void) => store.subscribe(conversationID, listener),
+    [conversationID, store],
+  );
+  const getSnapshot = React.useCallback(
+    () => store.getConversationStatus(conversationID),
+    [conversationID, store],
+  );
+  return React.useSyncExternalStore(subscribe, getSnapshot, () => "idle" as const);
 }
