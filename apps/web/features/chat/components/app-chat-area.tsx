@@ -36,6 +36,7 @@ import {
   useChatComposerState,
 } from "@/features/chat/hooks/use-chat-composer-state";
 import { useChatConversationActions } from "@/features/chat/hooks/use-chat-conversation-actions";
+import { useChatConversationCompletion } from "@/features/chat/hooks/use-chat-conversation-completion";
 import { useChatConversationDefaults } from "@/features/chat/hooks/use-chat-conversation-defaults";
 import { useChatData } from "@/features/chat/hooks/use-chat-data";
 import { useChatFileDrag } from "@/features/chat/hooks/use-chat-file-drag";
@@ -504,6 +505,10 @@ export function AppChatArea() {
     resumingRunID,
   });
   const generating = sending;
+  useChatConversationCompletion(
+    conversationID,
+    !temporaryMode && !loading && !errorMsg.trim() && messageDataConversationID === conversationID,
+  );
   React.useEffect(() => {
     const normalizedConversationID = conversationID?.trim() || "";
     if (!normalizedConversationID || sending || resumingRunID) {

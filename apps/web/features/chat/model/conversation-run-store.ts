@@ -6,7 +6,6 @@ export type ConversationRunSnapshot = {
 // local 记录连续缺席权威快照超过该时长后视为失效并移除。
 // 需大于「本地注册到服务端登记完成」的竞态窗口，小于用户可感知的卡死时长。
 const LOCAL_RUN_SNAPSHOT_MISS_TTL_MS = 15_000;
-const COMPLETED_STATUS_TTL_MS = 4_000;
 
 export type ConversationStatus = "idle" | "running" | "completed";
 
@@ -21,8 +20,8 @@ type Listener = () => void;
 
 export class ConversationRunStore {
   private readonly records = new Map<string, ConversationRunRecord>();
+  // 完成提示保留到用户查看，不因后台等待时间而过期。
   private readonly completedConversationIDs = new Set<string>();
-  private readonly completedTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly listeners = new Map<string, Set<Listener>>();
 
   subscribe(conversationPublicID: string, listener: Listener): () => void {
@@ -74,17 +73,18 @@ export class ConversationRunStore {
       return;
     }
     this.mutate(() => {
-      this.clearCompletedConversation(conversationID);
       this.completedConversationIDs.add(conversationID);
     });
-    const timer = setTimeout(() => {
-      this.completedTimers.delete(conversationID);
-      if (!this.completedConversationIDs.delete(conversationID)) {
-        return;
-      }
-      this.notifyConversation(conversationID);
-    }, COMPLETED_STATUS_TTL_MS);
-    this.completedTimers.set(conversationID, timer);
+  }
+
+  acknowledgeConversationCompletion(conversationPublicID: string): void {
+    const conversationID = conversationPublicID.trim();
+    if (!conversationID) {
+      return;
+    }
+    this.mutate(() => {
+      this.clearCompletedConversation(conversationID);
+    });
   }
 
   complete(runID: string, conversationPublicID: string): void {
@@ -271,10 +271,6 @@ export class ConversationRunStore {
   }
 
   clear(): void {
-    for (const timer of this.completedTimers.values()) {
-      clearTimeout(timer);
-    }
-    this.completedTimers.clear();
     this.mutate(() => {
       this.records.clear();
       this.completedConversationIDs.clear();
@@ -285,11 +281,6 @@ export class ConversationRunStore {
     const conversationID = conversationPublicID.trim();
     if (!conversationID) {
       return;
-    }
-    const timer = this.completedTimers.get(conversationID);
-    if (timer !== undefined) {
-      clearTimeout(timer);
-      this.completedTimers.delete(conversationID);
     }
     this.completedConversationIDs.delete(conversationID);
   }

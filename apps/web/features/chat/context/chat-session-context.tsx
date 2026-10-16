@@ -10,6 +10,7 @@ type ChatSessionContextValue = {
   newConversationProjectID: string;
   newConversationRoleID: string;
   newConversationAgentGroupID: string;
+  acknowledgeConversationCompletion: (conversationPublicID: string) => void;
   completeConversationRun: (runID: string, conversationPublicID: string) => void;
   detachConversationRun: (runID: string) => void;
   finishConversationRun: (runID: string) => void;
@@ -23,6 +24,7 @@ const ConversationRunStoreContext = React.createContext<ConversationRunStore | n
 export function ChatSessionProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = React.useState({ revision: 0, projectID: "", roleID: "", agentGroupID: "" });
   const {
+    acknowledgeConversationCompletion,
     completeConversationRun,
     detachConversationRun,
     finishConversationRun,
@@ -43,6 +45,7 @@ export function ChatSessionProvider({ children }: { children: React.ReactNode })
       newConversationProjectID: state.projectID,
       newConversationRoleID: state.roleID,
       newConversationAgentGroupID: state.agentGroupID,
+      acknowledgeConversationCompletion,
       completeConversationRun,
       detachConversationRun,
       finishConversationRun,
@@ -50,6 +53,7 @@ export function ChatSessionProvider({ children }: { children: React.ReactNode })
       requestNewConversation,
     }),
     [
+      acknowledgeConversationCompletion,
       completeConversationRun,
       detachConversationRun,
       finishConversationRun,

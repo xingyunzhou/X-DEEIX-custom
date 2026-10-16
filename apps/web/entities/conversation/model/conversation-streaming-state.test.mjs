@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import test from "node:test";
 
 import { updateConversationStreamingOwner } from "./conversation-streaming-state.ts";
+import { ConversationRunStore } from "../../../features/chat/model/conversation-run-store.ts";
 
 const globalStyles = readFileSync(new URL("../../../app/globals.css", import.meta.url), "utf8");
 const sidebarConversationItem = readFileSync(
@@ -31,6 +32,59 @@ test("run owners are isolated by conversation", () => {
 
   assert.equal(updateConversationStreamingOwner(owners, "conversation-1", "run-1", false), false);
   assert.equal(owners.has("conversation-2"), true);
+});
+
+test("background completion stays visible until the conversation is viewed", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const store = new ConversationRunStore();
+  const statuses = [];
+  store.subscribe("conversation-1", () => {
+    statuses.push(store.getConversationStatus("conversation-1"));
+  });
+
+  store.register("run-1", "conversation-1");
+  store.complete("run-1", "conversation-1");
+  t.mock.timers.tick(60_000);
+  assert.equal(store.getConversationStatus("conversation-1"), "completed");
+
+  store.acknowledgeConversationCompletion("conversation-1");
+  assert.equal(store.getConversationStatus("conversation-1"), "idle");
+  assert.deepEqual(statuses, ["running", "completed", "idle"]);
+});
+
+test("viewing one completed conversation does not clear other completion reminders", () => {
+  const store = new ConversationRunStore();
+  store.applyCompleted("conversation-1");
+  store.applyCompleted("conversation-2");
+
+  store.acknowledgeConversationCompletion("conversation-1");
+
+  assert.equal(store.getConversationStatus("conversation-1"), "idle");
+  assert.equal(store.getConversationStatus("conversation-2"), "completed");
+});
+
+test("a new run replaces the previous completion reminder", () => {
+  const store = new ConversationRunStore();
+  store.complete("run-1", "conversation-1");
+  store.register("run-2", "conversation-1");
+  assert.equal(store.getConversationStatus("conversation-1"), "running");
+
+  store.settle("run-2");
+  assert.equal(store.getConversationStatus("conversation-1"), "idle");
+});
+
+test("acknowledging a completion does not stop an active run", () => {
+  const store = new ConversationRunStore();
+  store.register("run-1", "conversation-1");
+  store.register("run-2", "conversation-1");
+  store.complete("run-1", "conversation-1");
+  store.acknowledgeConversationCompletion("conversation-1");
+
+  assert.equal(store.getConversationStatus("conversation-1"), "running");
+  store.complete("run-2", "conversation-1");
+  assert.equal(store.getConversationStatus("conversation-1"), "completed");
+  store.clear();
+  assert.equal(store.getConversationStatus("conversation-1"), "idle");
 });
 
 test("streaming titles sweep only their text while unread dots remain completion-only", () => {
