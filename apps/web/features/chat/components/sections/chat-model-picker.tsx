@@ -52,19 +52,30 @@ const DESKTOP_GROUP_MENU_VERTICAL_CHROME = 40;
 /** Model submenu non-list chrome: p-1.5 × 2. */
 const DESKTOP_SUBMENU_VERTICAL_CHROME = 12;
 
+type ModelGroup = {
+  label: string;
+  icon: string;
+  items: ChatModelOption[];
+  /** 组内最新的上游 ID，用于把新添加的供应商排在最前。 */
+  latestUpstreamID: number;
+};
+
 function resolveModelGroups(modelOptions: ChatModelOption[], orderBy?: string[] | null) {
-  const groupMap = new Map<string, { label: string; icon: string; items: ChatModelOption[] }>();
+  const groupMap = new Map<string, ModelGroup>();
   for (const item of modelOptions) {
     const presentation = resolveModelPresentationGroup(item);
+    const upstreamID = item.upstreamID ?? 0;
     const group = groupMap.get(presentation.key);
     if (group) {
       group.items.push(item);
+      group.latestUpstreamID = Math.max(group.latestUpstreamID, upstreamID);
       continue;
     }
     groupMap.set(presentation.key, {
       label: presentation.label,
       icon: presentation.icon,
       items: [item],
+      latestUpstreamID: upstreamID,
     });
   }
 
@@ -89,7 +100,21 @@ function resolveModelGroups(modelOptions: ChatModelOption[], orderBy?: string[] 
     }
   }
 
-  return Array.from(groupMap.entries()).map(([key, group]) => ({ key, ...group }));
+  // 新添加的供应商（上游 ID 更大）固定排在最前；没有上游信息的组保持原相对顺序。
+  return Array.from(groupMap.entries())
+    .map(([key, group]) => ({ key, ...group }))
+    .sort((a, b) => {
+      if (a.latestUpstreamID > 0 && b.latestUpstreamID > 0) {
+        return b.latestUpstreamID - a.latestUpstreamID;
+      }
+      if (a.latestUpstreamID > 0) {
+        return -1;
+      }
+      if (b.latestUpstreamID > 0) {
+        return 1;
+      }
+      return 0;
+    });
 }
 
 // 按用户自定义顺序排列 flat 模型列表（未收录的模型追加尾部，保持原相对顺序）。
