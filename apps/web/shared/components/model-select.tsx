@@ -48,6 +48,7 @@ type OptionSelectProps<TOption extends OptionSelectOption> = {
   renderIcon?: (option: TOption | undefined) => React.ReactNode;
   renderOption?: (option: TOption) => React.ReactNode;
   onChange: (value: string) => void;
+  onOpenChange?: (open: boolean) => void;
 };
 
 export function OptionSelect<TOption extends OptionSelectOption>({
@@ -69,6 +70,7 @@ export function OptionSelect<TOption extends OptionSelectOption>({
   renderIcon,
   renderOption,
   onChange,
+  onOpenChange,
 }: OptionSelectProps<TOption>) {
   const t = useTranslations("common.select");
   const normalizedValue = value.trim();
@@ -116,6 +118,7 @@ export function OptionSelect<TOption extends OptionSelectOption>({
       itemToStringValue={(item) => item?.value ?? ""}
       isItemEqualToValue={(item, selected) => item.value === selected.value}
       disabled={disabled}
+      onOpenChange={onOpenChange}
     >
       <ComboboxTrigger
         render={

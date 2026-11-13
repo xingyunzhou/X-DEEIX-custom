@@ -19,6 +19,7 @@ export type ReasoningEffortSelectorProps = {
   disabled?: boolean;
   className?: string;
   onChange: (value: string) => void;
+  onOpenChange?: (open: boolean) => void;
 };
 
 // 思考强度选择器：无支持协议且未传显式档位时返回 null 隐藏；
@@ -30,6 +31,7 @@ export function ReasoningEffortSelector({
   disabled,
   className,
   onChange,
+  onOpenChange,
 }: ReasoningEffortSelectorProps) {
   const t = useTranslations("chat.reasoningEffort");
   const mapping = resolveReasoningEffortForProtocols(protocols);
@@ -56,6 +58,7 @@ export function ReasoningEffortSelector({
       triggerClassName={className}
       renderIcon={() => <Zap className="size-3.5 shrink-0 text-muted-foreground" strokeWidth={1.7} />}
       onChange={onChange}
+      onOpenChange={onOpenChange}
     />
   );
 }

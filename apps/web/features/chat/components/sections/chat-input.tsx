@@ -439,6 +439,8 @@ function ChatInputComponent({
   const [isVoiceHovered, setIsVoiceHovered] = React.useState(false);
   const [toolsMenuHovered, setToolsMenuHovered] = React.useState(false);
   const [toolsMenuOpen, setToolsMenuOpen] = React.useState(false);
+  const [reasoningEffortMenuOpen, setReasoningEffortMenuOpen] = React.useState(false);
+  const [reasoningEffortTooltipOpen, setReasoningEffortTooltipOpen] = React.useState(false);
   const [editingQueuedMessageID, setEditingQueuedMessageID] = React.useState<string | null>(null);
   const [editingQueuedMessageContent, setEditingQueuedMessageContent] = React.useState("");
   const handleSpeechInputError = React.useCallback((error: SpeechInputErrorCode) => {
@@ -1443,7 +1445,12 @@ function ChatInputComponent({
                 </Tooltip>
               ) : null}
               {showModelControls && reasoningEffortProtocol ? (
-                <Tooltip>
+                <Tooltip
+                  open={reasoningEffortMenuOpen ? false : reasoningEffortTooltipOpen}
+                  onOpenChange={(open) => {
+                    setReasoningEffortTooltipOpen(open && !reasoningEffortMenuOpen);
+                  }}
+                >
                   <TooltipTrigger asChild>
                     <span className="inline-flex shrink-0">
                       <ReasoningEffortSelector
@@ -1452,6 +1459,7 @@ function ChatInputComponent({
                         disabled={loading || uploading || modelLoading}
                         className="h-7 max-w-28 rounded-md border-transparent bg-transparent hover:bg-accent/60 dark:border-transparent dark:bg-transparent dark:hover:bg-accent/40 sm:h-8"
                         onChange={onReasoningEffortChange}
+                        onOpenChange={setReasoningEffortMenuOpen}
                       />
                     </span>
                   </TooltipTrigger>
