@@ -12,7 +12,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { useTranslations } from "next-intl";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
   Accordion,
@@ -64,6 +64,8 @@ import {
 } from "@/components/ui/tooltip";
 import {
   createAdminLLMUpstream,
+  getAdminLLMUpstreamSiteTitle,
+  syncAdminLLMUpstreamModels,
   updateAdminLLMUpstream,
 } from "@/features/admin/api";
 import type {
@@ -78,6 +80,7 @@ import { COMPATIBLE_OPTIONS, resolveProtocolLabel } from "@/features/admin/utils
 import { useLocalizedErrorMessage } from "@/i18n/use-localized-error";
 import { resolveAccessToken } from "@/shared/auth/resolve-access-token";
 import { JsonCodeEditor } from "@/shared/components/json-code-editor";
+import { useDebouncedValue } from "@/shared/hooks/use-debounced-value";
 import { useDialogSnapshot } from "@/shared/hooks/use-dialog-snapshot";
 
 const PROTOCOL_DEFAULT_KINDS = [
@@ -306,6 +309,22 @@ function protocolDefaultValue(raw: string, kind: string): string {
   return parseProtocolDefaults(raw)[kind] || NO_PROTOCOL_DEFAULT;
 }
 
+function normalizeUpstreamURL(raw: string): string {
+  const value = raw.trim();
+  if (!value) return "";
+  return /^https?:\/\//i.test(value) ? value : `https://${value}`;
+}
+
+function resolveUpstreamHost(raw: string): string {
+  const value = normalizeUpstreamURL(raw);
+  if (!value) return "";
+  try {
+    return new URL(value).hostname;
+  } catch {
+    return "";
+  }
+}
+
 type UpstreamSheetProps = {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -393,14 +412,66 @@ export function UpstreamSheet({
   const [pendingDeleteAPIKeyIDs, setPendingDeleteAPIKeyIDs] = useState<Set<string>>(() => new Set());
   const [deleteAPIKeyTarget, setDeleteAPIKeyTarget] = useState<MaskedAPIKeyItem | null>(null);
   const stableDeleteAPIKeyTarget = useDialogSnapshot(deleteAPIKeyTarget);
+  const formRef = useRef(form);
+  const nameTouchedRef = useRef(false);
+  const autoFilledNameRef = useRef("");
+  const debouncedBaseUrl = useDebouncedValue(form.baseUrl.trim(), 600);
+  formRef.current = form;
   useEffect(() => {
     if (open) {
       setForm(buildInitialState(target));
       setExpandedSections([]);
       setPendingDeleteAPIKeyIDs(new Set());
       setDeleteAPIKeyTarget(null);
+      nameTouchedRef.current = false;
+      autoFilledNameRef.current = "";
     }
   }, [open, target]);
+
+  // 新建上游时按接口站点标题回填名称；获取不到标题则回填接口主域。
+  useEffect(() => {
+    if (mode !== "create" || !debouncedBaseUrl) {
+      return;
+    }
+    const currentName = formRef.current.name;
+    if (nameTouchedRef.current && currentName !== autoFilledNameRef.current && currentName.trim()) {
+      return;
+    }
+    const fallbackHost = resolveUpstreamHost(debouncedBaseUrl);
+    // 先同步回填主域，标题返回后再替换，避免用户等待期间名称为空。
+    if (fallbackHost) {
+      autoFilledNameRef.current = fallbackHost;
+      setForm((prev) => (prev.name === fallbackHost ? prev : { ...prev, name: fallbackHost }));
+    }
+    const controller = new AbortController();
+    void (async () => {
+      let nextName = fallbackHost;
+      try {
+        const token = await resolveAccessToken();
+        if (!token) {
+          return;
+        }
+        const title = await getAdminLLMUpstreamSiteTitle(
+          token,
+          normalizeUpstreamURL(debouncedBaseUrl),
+          controller.signal,
+        );
+        nextName = title.title.trim() || title.host.trim() || fallbackHost;
+      } catch {
+        // 标题获取失败时使用主域回填。
+      }
+      if (controller.signal.aborted || !nextName) {
+        return;
+      }
+      const latestName = formRef.current.name;
+      if (nameTouchedRef.current && latestName !== autoFilledNameRef.current && latestName.trim()) {
+        return;
+      }
+      autoFilledNameRef.current = nextName;
+      setForm((prev) => (prev.name === nextName ? prev : { ...prev, name: nextName }));
+    })();
+    return () => controller.abort();
+  }, [debouncedBaseUrl, mode]);
 
   function setField<K extends keyof FormState>(key: K, value: FormState[K]) {
     setForm((prev) => ({ ...prev, [key]: value }));
@@ -496,8 +567,17 @@ export function UpstreamSheet({
         const data = await createAdminLLMUpstream(token, payload);
         onSuccess(data.upstream);
         onOpenChange(false);
-        onManageModels?.(data.upstream);
         toast.success(t("toast.upstreamCreated"));
+        // 创建后自动同步模型目录，但不导入任何路由绑定（全不选）。
+        void syncAdminLLMUpstreamModels(token, data.upstream.id, { allowEmpty: true })
+          .then(() => {
+            toast.success(t("toast.modelsSynced"));
+          })
+          .catch((error) => {
+            toast.error(t("toast.modelsSyncFailed"), {
+              description: resolveErrorMessage(error),
+            });
+          });
       } else if (target) {
         const payload: UpdateAdminLLMUpstreamRequest = {};
         const nextName = form.name.trim();
@@ -586,7 +666,10 @@ export function UpstreamSheet({
                 required
                 placeholder={t("sheet.namePlaceholder")}
                 value={form.name}
-                onChange={(e) => setField("name", e.target.value)}
+                onChange={(e) => {
+                  nameTouchedRef.current = true;
+                  setField("name", e.target.value);
+                }}
               />
             </div>
 

@@ -20,6 +20,7 @@ import type {
   AdminLLMUpstreamData,
   AdminLLMUpstreamModelData,
   AdminLLMUpstreamModelDTO,
+  AdminLLMUpstreamSiteTitle,
   AdminLLMUpstreamView,
   BindAdminLLMModelUpstreamSourceRequest,
   CreateAdminLLMModelRequest,
@@ -66,6 +67,20 @@ type ListAdminLLMUpstreamModelsOptions = AdminPageOptions & {
 // ---------------------------------------------------------------------------
 // Upstream
 // ---------------------------------------------------------------------------
+
+// 代取上游接口站点标题；后端无法获取时返回主域供名称回填。
+export async function getAdminLLMUpstreamSiteTitle(
+  accessToken: string,
+  url: string,
+  signal?: AbortSignal,
+): Promise<AdminLLMUpstreamSiteTitle> {
+  const params = new URLSearchParams({ url: url.trim() });
+  return authedRequest<AdminLLMUpstreamSiteTitle>(
+    `/api/v1/admin/llm/upstream-site-title?${params.toString()}`,
+    { accessToken, signal },
+    true,
+  );
+}
 
 export async function listAdminLLMUpstreams(
   accessToken: string,

@@ -71,6 +71,8 @@
   "toast": {
     "upstreamCreated": "Upstream created",
     "upstreamUpdated": "Upstream updated",
+    "modelsSynced": "Model catalog synced automatically",
+    "modelsSyncFailed": "Model catalog sync failed",
     "createFailed": "Could not create upstream",
     "updateFailed": "Could not update upstream",
     "upstreamsLoadFailed": "Failed to load upstreams",

@@ -71,6 +71,8 @@
   "toast": {
     "upstreamCreated": "上游已创建",
     "upstreamUpdated": "上游已更新",
+    "modelsSynced": "模型列表已自动同步",
+    "modelsSyncFailed": "模型列表自动同步失败",
     "createFailed": "创建失败",
     "updateFailed": "更新失败",
     "upstreamsLoadFailed": "加载上游列表失败",

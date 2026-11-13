@@ -17,6 +17,7 @@ func (m *Module) RegisterRoutes(authRequired *gin.RouterGroup) {
 func (m *Module) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
 	// 上游管理
 	adminGroup.GET("/llm/upstreams", m.Handler.ListUpstreams)
+	adminGroup.GET("/llm/upstream-site-title", m.Handler.GetUpstreamSiteTitle)
 	adminGroup.POST("/llm/upstreams", m.Handler.CreateUpstream)
 	adminGroup.POST("/llm/upstreams/batch-delete", m.Handler.BatchDeleteUpstreams)
 	adminGroup.PATCH("/llm/upstreams/:id", m.Handler.UpdateUpstream)

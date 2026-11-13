@@ -11,6 +11,7 @@ import (
 	"github.com/DEEIX-AI/DEEIX-Chat/backend/internal/infra/config"
 	"github.com/DEEIX-AI/DEEIX-Chat/backend/internal/ports/llm"
 	"github.com/DEEIX-AI/DEEIX-Chat/backend/internal/repository"
+	"github.com/DEEIX-AI/DEEIX-Chat/backend/internal/shared/security"
 	"go.uber.org/zap"
 )
 
@@ -113,6 +114,7 @@ type Service struct {
 	subGroupResolver    subscriptionGroupResolver
 	logger              *zap.Logger
 	objectStoreProvider appstorage.Provider
+	outboundPolicy      security.OutboundPolicy
 
 	modelCatalogMu         sync.RWMutex
 	modelCatalog           []ModelView
@@ -127,6 +129,11 @@ type Service struct {
 // SetObjectStoreProvider 注入运行时对象存储，用于管理员自定义模型图标。
 func (s *Service) SetObjectStoreProvider(provider appstorage.Provider) {
 	s.objectStoreProvider = provider
+}
+
+// SetOutboundPolicy 注入管理员配置端点的出站安全策略。
+func (s *Service) SetOutboundPolicy(policy security.OutboundPolicy) {
+	s.outboundPolicy = policy
 }
 
 // SetModelIconAssetRepository 注入自定义模型图标元数据仓储。

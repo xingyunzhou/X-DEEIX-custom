@@ -105,6 +105,28 @@ func (h *Handler) ListUpstreams(c *gin.Context) {
 	response.SuccessPage(c, total, results)
 }
 
+// GetUpstreamSiteTitle godoc
+// @Summary 解析上游接口站点标题
+// @Description 尽力获取上游地址根页面的 title，获取失败时返回主域供名称回填
+// @Tags llm
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Param url query string true "上游地址"
+// @Success 200 {object} UpstreamSiteTitleResponseDoc
+// @Failure 400 {object} ErrorDoc
+// @Failure 500 {object} ErrorDoc
+// @Router /admin/llm/upstream-site-title [get]
+func (h *Handler) GetUpstreamSiteTitle(c *gin.Context) {
+	rawURL := c.Query("url")
+	view, err := h.service.ResolveUpstreamSiteTitle(c.Request.Context(), rawURL)
+	if err != nil {
+		response.InvalidQueryParam(c, "url")
+		return
+	}
+	response.Success(c, UpstreamSiteTitleResponse{Title: view.Title, Host: view.Host})
+}
+
 // CreateUpstream godoc
 // @Summary 管理员创建上游
 // @Description 管理员新增上游来源配置，内部标识自动分配

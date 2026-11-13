@@ -99,6 +99,11 @@ export type AdminLLMUpstreamView = Omit<
 
 export type AdminLLMUpstreamAPIKey = UpstreamAPIKeyResponse;
 
+export type AdminLLMUpstreamSiteTitle = {
+  title: string;
+  host: string;
+};
+
 export type AdminLLMModelDTO = Omit<
   ModelResponse,
   "accessScope" | "cbPolicyMode" | "defaultTaskTypes" | "status" | "vendor"

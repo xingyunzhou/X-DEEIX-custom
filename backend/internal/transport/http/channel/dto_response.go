@@ -36,6 +36,18 @@ type UpstreamResponse struct {
 	UpdatedAt            string                   `json:"updatedAt"`
 }
 
+// UpstreamSiteTitleResponse 上游接口站点标题解析结果。
+type UpstreamSiteTitleResponse struct {
+	Title string `json:"title"`
+	Host  string `json:"host"`
+}
+
+// UpstreamSiteTitleResponseDoc 上游接口站点标题响应文档。
+type UpstreamSiteTitleResponseDoc struct {
+	ErrorMsg string                    `json:"errorMsg"`
+	Data     UpstreamSiteTitleResponse `json:"data"`
+}
+
 // UpstreamAPIKeyResponse 上游脱敏 API Key 展示项。
 type UpstreamAPIKeyResponse struct {
 	ID        string `json:"id"`
@@ -89,33 +101,33 @@ func toUpstreamAPIKeyResponses(items []appchannel.UpstreamAPIKeyView) []Upstream
 
 // ModelResponse 模型响应 DTO。
 type ModelResponse struct {
-	ID                 uint   `json:"id"`
-	PlatformModelName  string `json:"platformModelName"`
-	Vendor             string `json:"vendor"`
-	VendorName         string `json:"vendorName"`
-	VendorIcon         string `json:"vendorIcon"`
-	DisplayGroupID     *uint  `json:"displayGroupID" extensions:"x-nullable,!x-omitempty"`
-	DisplayGroupName   string `json:"displayGroupName"`
-	DisplayGroupIcon   string `json:"displayGroupIcon"`
-	KindsJSON          string `json:"kindsJSON"`
-	Icon               string `json:"icon"`
-	CapabilitiesJSON   string `json:"capabilitiesJSON"`
-	ContextWindow      int    `json:"contextWindow"`
-	SystemPrompt       string `json:"systemPrompt"`
-	AccessScope        string `json:"accessScope"`
-	Status             string `json:"status"`
-	Description        string `json:"description"`
-	CbPolicyMode       string `json:"cbPolicyMode"`
-	CbFailureThreshold int    `json:"cbFailureThreshold"`
-	CbDurationMin      int    `json:"cbDurationMin"`
-	CbWindowMin        int    `json:"cbWindowMin"`
-	SortOrder          int    `json:"sortOrder"`
-	SourceCount        int64  `json:"sourceCount"`
-	ActiveSourceCount  int64  `json:"activeSourceCount"`
-	ProtocolsJSON      string `json:"protocolsJSON"`
-	UpstreamNamesJSON  string `json:"upstreamNamesJSON"`
-	CreatedAt          string `json:"createdAt"`
-	UpdatedAt          string `json:"updatedAt"`
+	ID                 uint     `json:"id"`
+	PlatformModelName  string   `json:"platformModelName"`
+	Vendor             string   `json:"vendor"`
+	VendorName         string   `json:"vendorName"`
+	VendorIcon         string   `json:"vendorIcon"`
+	DisplayGroupID     *uint    `json:"displayGroupID" extensions:"x-nullable,!x-omitempty"`
+	DisplayGroupName   string   `json:"displayGroupName"`
+	DisplayGroupIcon   string   `json:"displayGroupIcon"`
+	KindsJSON          string   `json:"kindsJSON"`
+	Icon               string   `json:"icon"`
+	CapabilitiesJSON   string   `json:"capabilitiesJSON"`
+	ContextWindow      int      `json:"contextWindow"`
+	SystemPrompt       string   `json:"systemPrompt"`
+	AccessScope        string   `json:"accessScope"`
+	Status             string   `json:"status"`
+	Description        string   `json:"description"`
+	CbPolicyMode       string   `json:"cbPolicyMode"`
+	CbFailureThreshold int      `json:"cbFailureThreshold"`
+	CbDurationMin      int      `json:"cbDurationMin"`
+	CbWindowMin        int      `json:"cbWindowMin"`
+	SortOrder          int      `json:"sortOrder"`
+	SourceCount        int64    `json:"sourceCount"`
+	ActiveSourceCount  int64    `json:"activeSourceCount"`
+	ProtocolsJSON      string   `json:"protocolsJSON"`
+	UpstreamNamesJSON  string   `json:"upstreamNamesJSON"`
+	CreatedAt          string   `json:"createdAt"`
+	UpdatedAt          string   `json:"updatedAt"`
 	DefaultTaskTypes   []string `json:"defaultTaskTypes"`
 }
 
@@ -639,22 +651,22 @@ type CircuitResetResponse struct {
 
 // PublicModelResponse 面向前端的可用模型展示 DTO。
 type PublicModelResponse struct {
-	PlatformModelName   string                      `json:"platformModelName"`
-	Vendor              string                      `json:"vendor"`
-	VendorName          string                      `json:"vendorName"`
-	VendorIcon          string                      `json:"vendorIcon"`
-	DisplayGroupID      *uint                       `json:"displayGroupID" extensions:"x-nullable,!x-omitempty"`
-	DisplayGroupName    string                      `json:"displayGroupName"`
-	DisplayGroupIcon    string                      `json:"displayGroupIcon"`
-	UpstreamID          *uint                       `json:"upstreamID" extensions:"x-nullable,!x-omitempty"`
-	UpstreamName        string                      `json:"upstreamName"`
-	KindsJSON           string                      `json:"kindsJSON"`
-	Icon                string                      `json:"icon"`
-	ProtocolsJSON       string                      `json:"protocolsJSON"`
-	CapabilitiesJSON    string                      `json:"capabilitiesJSON"`
-	Description         string                      `json:"description"`
-	SortOrder           int                         `json:"sortOrder"`
-	Pricing             *PublicModelPricingResponse `json:"pricing" extensions:"x-nullable,!x-omitempty"`
+	PlatformModelName string                      `json:"platformModelName"`
+	Vendor            string                      `json:"vendor"`
+	VendorName        string                      `json:"vendorName"`
+	VendorIcon        string                      `json:"vendorIcon"`
+	DisplayGroupID    *uint                       `json:"displayGroupID" extensions:"x-nullable,!x-omitempty"`
+	DisplayGroupName  string                      `json:"displayGroupName"`
+	DisplayGroupIcon  string                      `json:"displayGroupIcon"`
+	UpstreamID        *uint                       `json:"upstreamID" extensions:"x-nullable,!x-omitempty"`
+	UpstreamName      string                      `json:"upstreamName"`
+	KindsJSON         string                      `json:"kindsJSON"`
+	Icon              string                      `json:"icon"`
+	ProtocolsJSON     string                      `json:"protocolsJSON"`
+	CapabilitiesJSON  string                      `json:"capabilitiesJSON"`
+	Description       string                      `json:"description"`
+	SortOrder         int                         `json:"sortOrder"`
+	Pricing           *PublicModelPricingResponse `json:"pricing" extensions:"x-nullable,!x-omitempty"`
 }
 
 // PublicModelPricingResponse 面向前端的模型价格 DTO。
