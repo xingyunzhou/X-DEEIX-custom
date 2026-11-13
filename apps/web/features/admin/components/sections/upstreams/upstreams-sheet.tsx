@@ -65,7 +65,6 @@ import {
 import {
   createAdminLLMUpstream,
   getAdminLLMUpstreamSiteTitle,
-  syncAdminLLMUpstreamModels,
   updateAdminLLMUpstream,
 } from "@/features/admin/api";
 import type {
@@ -331,7 +330,7 @@ type UpstreamSheetProps = {
   mode: "create" | "edit";
   target: AdminLLMUpstreamView | null;
   onSuccess: (item: AdminLLMUpstreamView) => void;
-  onManageModels?: (item: AdminLLMUpstreamView) => void;
+  onManageModels?: (item: AdminLLMUpstreamView, options?: { autoSyncModels?: boolean }) => void;
 };
 
 type FormState = {
@@ -568,16 +567,8 @@ export function UpstreamSheet({
         onSuccess(data.upstream);
         onOpenChange(false);
         toast.success(t("toast.upstreamCreated"));
-        // 创建后自动同步模型目录，但不导入任何路由绑定（全不选）。
-        void syncAdminLLMUpstreamModels(token, data.upstream.id, { allowEmpty: true })
-          .then(() => {
-            toast.success(t("toast.modelsSynced"));
-          })
-          .catch((error) => {
-            toast.error(t("toast.modelsSyncFailed"), {
-              description: resolveErrorMessage(error),
-            });
-          });
+        // 创建后打开该上游的模型管理页，并自动同步目录；模型默认全不选。
+        onManageModels?.(data.upstream, { autoSyncModels: true });
       } else if (target) {
         const payload: UpdateAdminLLMUpstreamRequest = {};
         const nextName = form.name.trim();

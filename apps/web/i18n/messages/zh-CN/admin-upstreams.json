@@ -71,8 +71,6 @@
   "toast": {
     "upstreamCreated": "上游已创建",
     "upstreamUpdated": "上游已更新",
-    "modelsSynced": "模型列表已自动同步",
-    "modelsSyncFailed": "模型列表自动同步失败",
     "createFailed": "创建失败",
     "updateFailed": "更新失败",
     "upstreamsLoadFailed": "加载上游列表失败",
@@ -225,6 +223,8 @@
       "unsynced": "未同步"
     },
     "remoteLoadFailed": "获取远端模型失败",
+    "autoSyncDone": "模型目录已自动同步，请选择需要绑定的模型",
+    "autoSyncFailed": "模型目录自动同步失败",
     "importPartialFailed": "部分模型同步失败",
     "importDone": "模型同步完成",
     "importFailed": "模型同步失败",

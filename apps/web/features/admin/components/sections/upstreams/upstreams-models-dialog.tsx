@@ -489,7 +489,11 @@ type RemoteModelsDialogProps = {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   upstream: AdminLLMUpstreamView | null;
+  /** 打开后自动对账模型目录，且默认不勾选任何模型。 */
+  autoSyncOnOpen?: boolean;
+  selectAllByDefault?: boolean;
   onImported: () => void;
+  onAutoSyncHandled?: () => void;
 };
 
 type SyncPlanStatusKey = "added" | "updated" | "reactivated" | "inactivated" | "unchanged" | "protected";
@@ -542,12 +546,19 @@ function RemoteModelsDialog({
   open,
   onOpenChange,
   upstream,
+  autoSyncOnOpen = false,
+  selectAllByDefault = true,
   onImported,
+  onAutoSyncHandled,
 }: RemoteModelsDialogProps) {
   const t = useTranslations("adminUpstreams");
   const commonT = useTranslations("common");
   const resolveErrorMessage = useLocalizedErrorMessage();
   const [importing, setImporting] = React.useState(false);
+  const [autoSyncState, setAutoSyncState] = React.useState<"idle" | "running" | "done">("idle");
+  const selectAllByDefaultRef = React.useRef(selectAllByDefault);
+  const selectAllByDefaultPropRef = React.useRef(selectAllByDefault);
+  selectAllByDefaultPropRef.current = selectAllByDefault;
   const [remoteItems, setRemoteItems] = React.useState<AdminLLMRemoteModelItem[]>([]);
   const [selected, setSelected] = React.useState<Set<string>>(new Set());
   const [draftPlatformModelNames, setDraftPlatformModelNames] = React.useState<Map<string, string>>(new Map());
@@ -580,9 +591,65 @@ function RemoteModelsDialog({
     const items = dedupeRemoteModels(catalog.items);
     const syncableItems = items.filter((item) => !item.alreadyBound);
     setRemoteItems([...syncableItems, ...items.filter((item) => item.alreadyBound)]);
-    setSelected(new Set(syncableItems.map((item) => item.upstreamModelName)));
+    setSelected(
+      selectAllByDefaultRef.current
+        ? new Set(syncableItems.map((item) => item.upstreamModelName))
+        : new Set(),
+    );
     setDraftPlatformModelNames(createDraftPlatformModelNameMap(syncableItems));
   }, [catalog]);
+
+  React.useEffect(() => {
+    if (!open) {
+      setAutoSyncState("idle");
+      return;
+    }
+    // 以打开瞬间的模式为准，避免自动同步结束后父级清除标记导致选择被重新全选。
+    selectAllByDefaultRef.current = selectAllByDefaultPropRef.current;
+  }, [open]);
+
+  // 新建上游后自动对账目录，仍保持全不选，由用户决定要绑定哪些模型。
+  React.useEffect(() => {
+    if (!open || !autoSyncOnOpen || autoSyncState !== "idle" || !catalog) {
+      return;
+    }
+    setAutoSyncState("running");
+    setImporting(true);
+    void (async () => {
+      try {
+        await applySync({
+          allowEmpty: (catalog.total ?? 0) === 0,
+          expectedSnapshot: catalog.snapshotID,
+          items: [],
+        });
+        await loadRemoteModels();
+        setSelected(new Set());
+        onImported();
+        toast.success(t("modelsDialog.autoSyncDone"));
+      } catch (error) {
+        if (!isUpstreamModelSyncAbort(error)) {
+          toast.error(t("modelsDialog.autoSyncFailed"), {
+            description: resolveErrorMessage(error),
+          });
+        }
+      } finally {
+        setImporting(false);
+        setAutoSyncState("done");
+        onAutoSyncHandled?.();
+      }
+    })();
+  }, [
+    applySync,
+    autoSyncOnOpen,
+    autoSyncState,
+    catalog,
+    loadRemoteModels,
+    onAutoSyncHandled,
+    onImported,
+    open,
+    resolveErrorMessage,
+    t,
+  ]);
 
   React.useEffect(() => {
     if (!catalogError) return;
@@ -1221,8 +1288,10 @@ type UpstreamModelsDialogProps = {
   onOpenChange: (open: boolean) => void;
   upstream: AdminLLMUpstreamView | null;
   openRemoteOnOpen?: boolean;
+  autoSyncOnOpen?: boolean;
   onUpstreamUpdated: (updated: AdminLLMUpstreamView) => void;
   onRemoteOpenHandled?: () => void;
+  onAutoSyncHandled?: () => void;
 };
 
 type RouteStatusFilter = "bound" | "active" | "inactive";
@@ -1260,8 +1329,10 @@ export function UpstreamModelsDialog({
   onOpenChange,
   upstream,
   openRemoteOnOpen = false,
+  autoSyncOnOpen = false,
   onUpstreamUpdated,
   onRemoteOpenHandled,
+  onAutoSyncHandled,
 }: UpstreamModelsDialogProps) {
   const t = useTranslations("adminUpstreams");
   const modelT = useTranslations("adminModels");
@@ -1917,10 +1988,13 @@ export function UpstreamModelsDialog({
           open={remoteModelsOpen}
           onOpenChange={setRemoteModelsOpen}
           upstream={stableUpstream}
+          autoSyncOnOpen={autoSyncOnOpen}
+          selectAllByDefault={!autoSyncOnOpen}
           onImported={() => {
             void loadBindings();
             onUpstreamUpdated({ ...stableUpstream });
           }}
+          onAutoSyncHandled={onAutoSyncHandled}
         />
       )}
 

@@ -78,6 +78,7 @@ export function AdminUpstreamsPage() {
   const upstreams = useAdminUpstreams();
   const circuitBreaker = useAdminCircuitBreaker();
   const [syncOnOpenUpstreamID, setSyncOnOpenUpstreamID] = React.useState<number | null>(null);
+  const [autoSyncOnOpenUpstreamID, setAutoSyncOnOpenUpstreamID] = React.useState<number | null>(null);
   const [statusConfirmOpen, setStatusConfirmOpen] = React.useState(false);
 
   return (
@@ -225,9 +226,13 @@ export function AdminUpstreamsPage() {
           mode={upstreams.sheetState.mode}
           target={upstreams.sheetState.mode === "edit" ? upstreams.sheetState.target : null}
           onSuccess={upstreams.handleSheetSuccess}
-          onManageModels={(item) => {
+          onManageModels={(item, options) => {
             upstreams.closeSheet();
             upstreams.handleManageModels(item);
+            if (options?.autoSyncModels) {
+              setSyncOnOpenUpstreamID(item.id);
+              setAutoSyncOnOpenUpstreamID(item.id);
+            }
           }}
         />
       ) : null}
@@ -259,8 +264,10 @@ export function AdminUpstreamsPage() {
         }}
         upstream={upstreams.modelsTarget}
         openRemoteOnOpen={syncOnOpenUpstreamID === upstreams.modelsTarget?.id}
+        autoSyncOnOpen={autoSyncOnOpenUpstreamID === upstreams.modelsTarget?.id}
         onUpstreamUpdated={upstreams.handleUpstreamUpdated}
         onRemoteOpenHandled={() => setSyncOnOpenUpstreamID(null)}
+        onAutoSyncHandled={() => setAutoSyncOnOpenUpstreamID(null)}
       />
 
       <AdminBulkConfirmDialog

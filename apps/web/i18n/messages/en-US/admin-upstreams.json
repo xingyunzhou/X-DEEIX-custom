@@ -71,8 +71,6 @@
   "toast": {
     "upstreamCreated": "Upstream created",
     "upstreamUpdated": "Upstream updated",
-    "modelsSynced": "Model catalog synced automatically",
-    "modelsSyncFailed": "Model catalog sync failed",
     "createFailed": "Could not create upstream",
     "updateFailed": "Could not update upstream",
     "upstreamsLoadFailed": "Failed to load upstreams",
@@ -225,6 +223,8 @@
       "unsynced": "Not synced"
     },
     "remoteLoadFailed": "Failed to fetch remote models",
+    "autoSyncDone": "Model catalog synced automatically. Select the models to bind.",
+    "autoSyncFailed": "Automatic model catalog sync failed",
     "importPartialFailed": "Some models failed to sync",
     "importDone": "Model sync completed",
     "importFailed": "Model sync failed",
